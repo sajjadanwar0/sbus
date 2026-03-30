@@ -1,109 +1,106 @@
-# S-Bus: Semantic Bus for Multi-Agent LLM Systems
+# S-Bus — Semantic Bus
 
-> Companion code for the IEEE TPDS paper  
-> *"Reliable Autonomous Orchestration: A Rust-Based Transactional Middleware  
->  for Mitigating Semantic Synchronization Overhead in Multi-Agent Systems"*
+> **Transactional middleware for multi-agent LLM systems**
 
-## Repository Structure
+**GitHub:** https://github.com/sajjadanwar0/sbus  
+**Experiment harness:** https://github.com/sajjadanwar0/agenticPaper  
+**Paper:** IEEE TPDS submission 2026
+
+S-Bus applies Multi-Version Concurrency Control (MVCC) principles to
+natural language state in multi-agent AI systems. It formally eliminates
+**Semantic Race Conditions** — the failure mode where concurrent agent
+mutations render global state unreachable from the task objective.
+
+---
+
+## Key results
+
+| System    | CWR (N=4) | CWR (N=8) | Reduction vs S-Bus | S@50 (N=8) |
+|-----------|-----------|-----------|--------------------|------------|
+| **S-Bus** | **0.238** | **0.210** | —                  | **80%**    |
+| LangGraph | 4.384     | 4.213     | 94.8%              | 40%        |
+| CrewAI    | 7.099     | 8.168     | 97.1%              | 20%        |
+| AutoGen   | 11.970    | 12.070    | 98.1%              | 44%        |
+
+Mann-Whitney U=0, p<0.0001, r=1.000 — complete separation in all comparisons.
+Zero state corruptions across 272 ACP commit attempts.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/sajjadanwar0/sbus
+cd sbus
+cargo run
+# Server starts on http://localhost:3000
+```
+
+### API
+
+| Method | Endpoint         | Description                    |
+|--------|------------------|--------------------------------|
+| POST   | `/shard`         | Create a new state shard       |
+| GET    | `/shard/{key}`   | Read current shard content     |
+| GET    | `/shards`        | List all shard keys            |
+| POST   | `/commit`        | Atomic Commit Protocol (ACP)   |
+| POST   | `/rollback`      | Roll back to prior version     |
+| GET    | `/stats`         | Server statistics              |
+| GET    | `/metrics`       | Prometheus metrics             |
+
+---
+
+## Performance
+
+| Benchmark                       | Throughput  | p50     | p99     |
+|--------------------------------|-------------|---------|---------|
+| Sequential commit               | >800K ops/s | 1.18 μs | 2.31 μs |
+| Parallel (4 agents, 4 shards)   | >3M ops/s   | 0.32 μs | 0.89 μs |
+| Parallel (16 agents, 16 shards) | >9M ops/s   | 0.11 μs | 0.43 μs |
+| High contention (16→1 shard)    | >300K ops/s | 3.21 μs | 8.44 μs |
+
+LLM inference (GPT-4o-mini) takes 500–2000 ms — the ACP is never the bottleneck.
+
+---
+
+## Project structure
 
 ```
 sbus/
 ├── src/
-│   ├── main.rs              # Axum HTTP server entry point
-│   ├── bus/
-│   │   ├── engine.rs        # S-Bus engine + Atomic Commit Protocol
-│   │   └── types.rs         # Shard, Delta, SyncError types
-│   ├── api/
-│   │   └── handlers.rs      # REST API handlers
-│   └── metrics/
-│       └── collector.rs     # CWR / S@50 / SCR metric collection
-├── benches/
-│   └── throughput.rs        # Criterion microbenchmarks
-├── datasets/
-│   └── long_horizon_tasks.json  # LHP benchmark (15 tasks)
-├── harness/
-│   ├── run_experiment.py    # Python experiment harness
-│   └── analyse.R            # Statistical analysis + figures
-└── paper/
-    └── paper.tex            # Full IEEE TPDS LaTeX paper
+│   ├── main.rs              # Axum server + routes
+│   ├── api/handlers.rs      # 10 REST endpoints
+│   ├── bus/engine.rs        # ACP + DashMap shard registry
+│   ├── bus/types.rs         # Shard, Delta, SyncError
+│   └── metrics/collector.rs # CWR / SCR metrics
+├── benches/throughput.rs    # Criterion benchmarks
+├── Cargo.toml
+└── README.md
 ```
 
-## Quick Start
+---
 
-### 1. Start the S-Bus server
+## Citation
 
-```bash
-cargo run --release
-# S-Bus listening on http://localhost:3000
+```bibtex
+@article{khan2026sbus,
+  title   = {Reliable Autonomous Orchestration: A Rust-Based Transactional
+             Middleware for Mitigating Semantic Synchronization Overhead
+             in Multi-Agent Systems},
+  author  = {Khan, Sajjad},
+  journal = {IEEE Transactions on Parallel and Distributed Systems},
+  year    = {2026},
+  note    = {Under review}
+}
 ```
 
-### 2. Run a quick smoke test
-
-```bash
-# Create a shard
-curl -X POST http://localhost:3000/shard \
-  -H 'Content-Type: application/json' \
-  -d '{"key":"goal_1","content":"initial state","goal_tag":"test"}'
-
-# Read it
-curl http://localhost:3000/shard/goal_1
-
-# Commit a delta
-curl -X POST http://localhost:3000/commit \
-  -H 'Content-Type: application/json' \
-  -d '{"key":"goal_1","expected_ver":0,"content":"updated","rationale":"step 1","agent_id":"agent-0"}'
-
-# Bus statistics
-curl http://localhost:3000/stats
-```
-
-### 3. Run microbenchmarks
-
-```bash
-cargo bench
-# Results in target/criterion/
-```
-
-### 4. Run experiments (requires OpenAI API key)
-
-```bash
-pip install openai httpx tiktoken pandas scipy
-export OPENAI_API_KEY=sk-...
-
-# Run S-Bus system on all tasks with 4 agents
-python harness/run_experiment.py --system sbus --agents 4
-
-# Run all systems (takes several hours + API credits)
-python harness/run_experiment.py --all --agents 2 4 8 16 --analyse
-```
-
-### 5. Generate paper figures
-
-```bash
-Rscript harness/analyse.R results/results.csv figures/
-# Produces fig1–fig4 + table1_main.tex
-```
-
-## API Reference
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/shard` | Create shard |
-| GET  | `/shard/:key` | Non-blocking read |
-| POST | `/commit` | Atomic Commit Protocol |
-| POST | `/rollback` | Version rollback |
-| GET  | `/stats` | Bus statistics (JSON) |
-| GET  | `/metrics` | Prometheus exposition |
-| GET  | `/results/csv` | Export run metrics |
-| GET  | `/results/agg` | Aggregated stats (JSON) |
-
-## Key Metrics
-
-- **CWR** (Coordination-to-Work Ratio): `coord_tokens / work_tokens` — lower is better  
-- **S@50** (Success at 50 steps): fraction of tasks solved within 50 agent steps  
-- **SCR** (Semantic Conflict Rate): `rejected_commits / total_attempts` — lower is better  
+---
 
 ## License
 
 MIT
-# sbus
+
+## Author
+
+**Sajjad Khan**   
+GitHub: [@sajjadanwar0](https://github.com/sajjadanwar0)
