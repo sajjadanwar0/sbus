@@ -1,57 +1,62 @@
-mod api;
-mod bus;
-mod metrics;
+// src/main.rs
+//
+// S-Bus HTTP server — Axum + Tokio.
+//
+// [GAP-FIX] Changes from original:
+//   - POST /commit/v2 route added (cross-shard read-set endpoint)
+//   - lease monitor spawned with constructive timeout argument
+//   - CORS kept permissive for experiment harness compatibility
 
-use api::handlers::{
-    aggregate_results, bus_stats, commit_delta, create_shard, export_csv,
-    list_shards, prometheus_metrics, read_shard, record_run, rollback, AppState,
-};
 use axum::{
     routing::{get, post},
     Router,
 };
-use bus::engine::SBus;
-use metrics::collector::MetricsCollector;
-use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{fmt, EnvFilter};
 
-pub mod bus_mod {}
+mod api {
+    pub mod handlers;
+}
+mod bus {
+    pub mod engine;
+    pub mod types;
+}
+
+use api::handlers;
+use bus::engine::SBus;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "sbus=info".to_string()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
+    // Logging
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,sbus=debug".parse().unwrap()),
+        )
         .init();
 
-    let state = AppState {
-        bus:     SBus::new(),
-        metrics: MetricsCollector::new(),
-    };
+    let bus = SBus::with_options(1_000, 30); // max_log_depth=1000, lease=30s
+
+    // [GAP-FIX] spawn lease monitor — makes Corollary 2 constructive
+    bus.clone().spawn_lease_monitor();
 
     let app = Router::new()
-        // Shard CRUD
-        .route("/shard",         post(create_shard))
-        .route("/shard/{key}",   get(read_shard))
-        .route("/shards",        get(list_shards))
-        // ACP
-        .route("/commit",        post(commit_delta))
-        .route("/rollback",      post(rollback))
-        // Observability
-        .route("/stats",         get(bus_stats))
-        .route("/metrics",       get(prometheus_metrics))
-        // Experiment result collection
-        .route("/results/run",   post(record_run))
-        .route("/results/csv",   get(export_csv))
-        .route("/results/agg",   get(aggregate_results))
+        // ── shard CRUD ──────────────────────────────────────────────────
+        .route("/shard",      post(handlers::create_shard))
+        .route("/shard/{key}", get(handlers::read_shard))
+        .route("/shards",     get(handlers::list_shards))
+        // ── ACP commit (original — backward-compatible) ─────────────────
+        .route("/commit",     post(handlers::commit))
+        // ── ACP commit v2 [GAP-FIX] — with optional read_set field ─────
+        .route("/commit/v2",  post(handlers::commit_v2))
+        // ── Other ────────────────────────────────────────────────────────
+        .route("/rollback",   post(handlers::rollback))
+        .route("/stats",      get(handlers::stats))
+        .route("/metrics",    get(handlers::metrics))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(bus);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = "0.0.0.0:3000";
     tracing::info!("S-Bus server listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

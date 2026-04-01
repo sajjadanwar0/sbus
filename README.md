@@ -4,7 +4,6 @@
 
 **GitHub:** https://github.com/sajjadanwar0/sbus  
 **Experiment harness:** https://github.com/sajjadanwar0/agenticPaper  
-**Paper:** IEEE TPDS submission 2026
 
 S-Bus applies Multi-Version Concurrency Control (MVCC) principles to
 natural language state in multi-agent AI systems. It formally eliminates
