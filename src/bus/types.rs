@@ -1,18 +1,74 @@
-// src/bus/types.rs
-//
 // All core types for the S-Bus shard registry and Atomic Commit Protocol.
-// Gap-fill additions (marked with [GAP-FIX]):
-//   - ReadSetEntry struct           (cross-shard phantom-read tracking)
-//   - CommitRequest.read_set field  (opt-in cross-shard validation)
-//   - SyncError::CrossShardStale   (new error variant)
 //
-// These additions make Corollary 1 (serializability) hold for multi-shard
-// operations, closing the proof gap identified in §8.9.
+// Additions vs original:
+//   - AcpConfig struct           (ablation flags + retry budget, Table 11)
+//   - ReadSetEntry struct         (cross-shard phantom-read tracking)
+//   - CommitRequest.read_set      (opt-in cross-shard validation)
+//   - SyncError::CrossShardStale  (new error variant)
+//
+// These additions make Corollary 2.1 (serializability) hold for multi-shard
+// operations under Assumption A1, closing the proof gap in §8.9.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use thiserror::Error;
+
+// ────────────────────────────────────────────────────────────────────────────
+// AcpConfig  —  runtime ablation flags and retry budget
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Runtime ACP configuration. Read from environment variables at startup.
+///
+/// Controls which ACP components are active (ablation study, Table 11)
+/// and the retry budget per agent per step (Definition 6, Corollary 2.2).
+///
+/// Environment variables:
+///   SBUS_TOKEN=0          → disable ownership token  (–token ablation)
+///   SBUS_VERSION=0        → disable version check    (–version ablation)
+///   SBUS_LOG=0            → disable delta log        (–log ablation)
+///   SBUS_TOKEN=0 SBUS_VERSION=0 → both disabled      (–both ablation)
+///   SBUS_RETRY_BUDGET=5   → increase retry budget (eliminates exhaustion at N=8)
+///   SBUS_LEASE_TIMEOUT=30 → token lease timeout in seconds
+#[derive(Clone, Debug, Serialize)]
+pub struct AcpConfig {
+    /// If false: skip token acquisition/release (–token ablation condition).
+    pub enable_ownership_token: bool,
+    /// If false: skip version mismatch check (–version ablation condition).
+    pub enable_version_check: bool,
+    /// If false: skip delta log append (–log ablation condition).
+    pub enable_delta_log: bool,
+    /// Retry budget B per agent per step (Definition 6, Corollary 2.2).
+    /// Default: 1. Set SBUS_RETRY_BUDGET=5 to eliminate all exhaustion events.
+    pub retry_budget: usize,
+    /// Token lease timeout in seconds (default: 30).
+    /// Drives the constructive liveness proof in Corollary 2.2.
+    pub lease_timeout_secs: u64,
+}
+
+impl AcpConfig {
+    pub fn from_env() -> Self {
+        Self {
+            enable_ownership_token: std::env::var("SBUS_TOKEN")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            enable_version_check: std::env::var("SBUS_VERSION")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            enable_delta_log: std::env::var("SBUS_LOG")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            retry_budget: std::env::var("SBUS_RETRY_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+            lease_timeout_secs: std::env::var("SBUS_LEASE_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        }
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Delta log entry
@@ -96,23 +152,24 @@ pub struct CreateShardRequest {
     pub goal_tag: String,
 }
 
-// [GAP-FIX] Cross-shard read-set entry.
-//
-// An agent that reads shards A and B before committing to shard C declares
-// those reads here.  The ACP checks that A and B have not advanced since the
-// read; if either has, it returns CrossShardStale.  This closes the phantom-
-// read gap described in §8.9 and makes Corollary 1 hold for multi-shard ops.
-//
-// Usage (Python agent side):
-//   read_set = [
-//       {"key": "db_schema",   "version_at_read": 3},
-//       {"key": "api_design",  "version_at_read": 2},
-//   ]
-//   POST /commit  body includes "read_set": read_set
-//
-// The field is Optional — agents that only touch their own shard omit it and
-// get the same single-shard serializability guarantee as before (backward-
-// compatible).
+/// Cross-shard read-set entry (Assumption A1, §3.3).
+///
+/// An agent that reads shards A and B before committing to shard C declares
+/// those reads here. The ACP checks that A and B have not advanced since the
+/// agent recorded their versions. If either has, it returns CrossShardStale
+/// and the agent must re-read and re-reason.
+///
+/// The field is Optional on CommitRequest — agents that only touch their own
+/// shard omit it and get the same single-shard serializability as before
+/// (backward-compatible). Corollary 2.1 holds for multi-shard operations only
+/// when all read shards are declared (Assumption A1).
+///
+/// Python usage:
+///   read_set = [
+///       {"key": "db_schema",  "version_at_read": 3},
+///       {"key": "api_design", "version_at_read": 2},
+///   ]
+///   POST /commit/v2  body includes "read_set": read_set
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadSetEntry {
     /// The shard key that was read
@@ -124,17 +181,19 @@ pub struct ReadSetEntry {
 #[derive(Debug, Deserialize)]
 pub struct CommitRequest {
     pub key: String,
-    // Accept "expected_version" (canonical) or "expected_ver" (original Python harness).
+    /// Accept "expected_version" (canonical) or "expected_ver" (Python harness).
     #[serde(alias = "expected_ver")]
     pub expected_version: u64,
-    // Accept "delta" (canonical) or "content" (original Python harness).
+    /// Accept "delta" (canonical) or "content" (Python harness).
     #[serde(alias = "content")]
     pub delta: String,
     pub agent_id: String,
-    // Original harness sends "rationale" — accept and ignore.
+    /// Original harness sends "rationale" — accepted and stored in delta log.
     #[serde(default)]
     pub rationale: Option<String>,
-    // [GAP-FIX] Optional cross-shard read-set for phantom-read prevention.
+    /// Optional cross-shard read-set for phantom-read prevention (Assumption A1).
+    /// When present and non-empty, the engine validates all listed shards have
+    /// not advanced since the agent's read time before applying the delta.
     #[serde(default)]
     pub read_set: Option<Vec<ReadSetEntry>>,
 }
@@ -204,21 +263,18 @@ pub enum SyncError {
     #[error("token conflict on key={key}: currently owned by {owner}")]
     TokenConflict { key: String, owner: String },
 
-    // [GAP-FIX v2] Returned when a cross-shard read-set entry is stale.
-    //
-    // engine.rs commit_delta() now acquires ALL shard locks (target + read_set)
-    // simultaneously in sorted key order (Havender 1968 deadlock prevention).
-    // The version check and delta application happen atomically under all locks.
-    // This eliminates the TOCTOU gap present in the v1 drop-and-reacquire
-    // implementation, which produced 2 corruptions at N=8 in the validation
-    // experiment.
-    //
-    // Proof implication (revised Appendix A, Lemma 1):
-    //   Because all locks are held from version-check through commit, no
-    //   thread can modify any declared dependency between the check and the
-    //   write.  The dependency graph edge ci → cj is therefore exact for
-    //   both single-shard and multi-shard operations at any agent count N.
-    //   Corollary 1 (serializability) holds without qualification.
+    /// Returned when a cross-shard read-set entry has advanced since the
+    /// agent recorded it. The engine now acquires ALL shard locks (target +
+    /// read_set) simultaneously in sorted key order (Havender 1968) before
+    /// performing any version check, eliminating the TOCTOU gap that existed
+    /// in the v1 drop-and-reacquire implementation.
+    ///
+    /// Proof implication (Appendix A, Lemma 1):
+    ///   All locks are held from version-check through commit. No thread can
+    ///   modify any declared dependency in that window. The dependency graph
+    ///   is therefore a DAG for both single- and multi-shard operations at
+    ///   any agent count N. Corollary 2.1 holds without qualification under
+    ///   Assumption A1.
     #[error(
         "cross-shard stale read: key={key} version_at_read={version_at_read} \
          current_version={current_version}"
@@ -229,10 +285,6 @@ pub enum SyncError {
         current_version: u64,
     },
 
-    // Reserved for a future hard-limit mode where overflow is an error
-    // rather than a silent eviction.  The current implementation evicts
-    // the oldest entry (pop_front) so this variant is never constructed —
-    // suppress the warning explicitly.
     #[allow(dead_code)]
     #[error("delta log overflow: max depth reached for key={key}")]
     LogOverflow { key: String },
@@ -242,27 +294,25 @@ pub enum SyncError {
 }
 
 impl SyncError {
-    /// HTTP status code for this error — used by Axum handlers.
     pub fn status_code(&self) -> u16 {
         match self {
-            SyncError::ShardNotFound { .. } => 404,
-            SyncError::VersionMismatch { .. } => 409,
-            SyncError::TokenConflict { .. } => 409,
-            SyncError::CrossShardStale { .. } => 409,
-            SyncError::LogOverflow { .. } => 507,
-            SyncError::Internal { .. } => 500,
+            SyncError::ShardNotFound { .. }    => 404,
+            SyncError::VersionMismatch { .. }  => 409,
+            SyncError::TokenConflict { .. }    => 409,
+            SyncError::CrossShardStale { .. }  => 409,
+            SyncError::LogOverflow { .. }      => 507,
+            SyncError::Internal { .. }         => 500,
         }
     }
 
-    /// Machine-readable error code for JSON responses.
     pub fn error_code(&self) -> &'static str {
         match self {
-            SyncError::ShardNotFound { .. } => "ShardNotFound",
-            SyncError::VersionMismatch { .. } => "VersionMismatch",
-            SyncError::TokenConflict { .. } => "TokenConflict",
-            SyncError::CrossShardStale { .. } => "CrossShardStale",
-            SyncError::LogOverflow { .. } => "LogOverflow",
-            SyncError::Internal { .. } => "InternalError",
+            SyncError::ShardNotFound { .. }    => "ShardNotFound",
+            SyncError::VersionMismatch { .. }  => "VersionMismatch",
+            SyncError::TokenConflict { .. }    => "TokenConflict",
+            SyncError::CrossShardStale { .. }  => "CrossShardStale",
+            SyncError::LogOverflow { .. }      => "LogOverflow",
+            SyncError::Internal { .. }         => "InternalError",
         }
     }
 }
