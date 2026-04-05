@@ -1,608 +1,527 @@
-// src/bus/engine.rs
+// src/bus/engine.rs — S-Bus ACP v19.
 //
-// S-Bus shard registry and Atomic Commit Protocol (ACP).
-//
-// Additions vs original:
-//   1. AcpConfig field on SBus + ablation-aware single-shard commit path
-//   2. apply_delta_inner_cfg() helper respecting all three ablation flags
-//   3. commit_v2_naive() — unordered lock acquisition (Table 6 control)
-//   4. acp_config block in stats() JSON
-//   5. cross_shard_stale_counter exposed in stats() and prometheus_metrics()
-//   6. Constructive liveness comment on spawn_lease_monitor() (Corollary 2.2)
+// Changes from v18:
+//  FIX-1: commit_v2_naive now uses genuine per-shard Mutex locks in INSERTION
+//          ORDER (not sorted), enabling deadlock at N>=2 with overlapping shards.
+//          This re-enables the deadlock demonstration retracted in the paper.
+//  FIX-2: rollback() performs token check inside a single with_map_write closure
+//          (eliminates TOCTOU window between token snapshot and version restore).
+//          COMPILE FIX: with_map_write returns R (not Option<R>); removed the
+//          incorrect match { None=>..., Some(r)=>r } pattern.
+//          BORROW FIX: extract tok_reg Arc clone before entering with_map_write
+//          so the closure does not double-borrow `self`.
+//  FIX-3: WAL stub wired in via Wal struct — enable with SBUS_WAL_PATH env var.
+//  All other guarantees unchanged. Zero unsafe blocks.
 
-use crate::bus::types::{
-    AcpConfig, CommitRequest, CommitResponse, CreateShardRequest, DeltaEntry,
-    RollbackRequest, Shard, ShardResponse, SyncError,
+use std::{
+    collections::HashMap,
+    io::{BufWriter, Write},
+    sync::{Arc, Mutex, RwLock},
+    sync::atomic::{AtomicU64, Ordering},
 };
-use chrono::Utc;
-use dashmap::DashMap;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use chrono::{DateTime, Utc};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
-// ────────────────────────────────────────────────────────────────────────────
-// SBus  —  the top-level registry handle (clone-safe Arc wrapper)
-// ────────────────────────────────────────────────────────────────────────────
+use crate::bus::{
+    registry::{SafeMap, SimpleMap},
+    types::{
+        AcpConfig, CommitRequest, CommitResponse, CreateShardRequest,
+        DeltaEntry, RollbackRequest, Shard, ShardResponse, SyncError,
+    },
+};
 
-/// Proposition 2 (Dual Ownership Enforcement):
-/// (a) Compile-time: Rust's affine type system statically guarantees at most
-///     one &mut Shard exists within the server process at any program point
-///     [Jung et al. 2018].
-/// (b) Runtime: DashMap's per-shard CAS (get_mut) enforces the same invariant
-///     for external HTTP clients (Theorem 2).
-/// Both are necessary; neither alone is sufficient.
+// ── Token entry ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct TokenEntry {
+    pub owner:       String,
+    pub acquired_at: DateTime<Utc>,
+}
+
+// ── Per-shard naive lock map (FIX-1) ─────────────────────────────────────────
+//
+// Used ONLY by commit_v2_naive. Keys are acquired in INSERTION ORDER (not
+// sorted) to demonstrate the deadlock the sorted-lock design prevents.
+
+type NaiveLockMap = Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>;
+
+fn get_or_create_naive_lock(map: &NaiveLockMap, key: &str) -> Arc<Mutex<()>> {
+    { // Fast read path
+        let r = map.read().unwrap();
+        if let Some(lk) = r.get(key) { return lk.clone(); }
+    }
+    // Slow write path
+    let mut w = map.write().unwrap();
+    w.entry(key.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+// ── WAL stub (FIX-3) ─────────────────────────────────────────────────────────
+// Enable: SBUS_WAL_PATH=/path/to/wal.log
+// Format: newline-delimited JSON per delta.
+
+struct Wal {
+    writer: Option<Mutex<BufWriter<std::fs::File>>>,
+}
+
+impl Wal {
+    fn from_env() -> Self {
+        let writer = std::env::var("SBUS_WAL_PATH").ok().and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true).append(true).open(&path).ok()
+                .map(|f| Mutex::new(BufWriter::new(f)))
+        });
+        Self { writer }
+    }
+
+    fn append(&self, key: &str, version: u64, agent_id: &str, delta: &str) {
+        if let Some(ref mx) = self.writer {
+            let entry = serde_json::json!({
+                "key": key, "version": version,
+                "agent_id": agent_id, "delta": delta,
+                "ts": Utc::now().to_rfc3339(),
+            });
+            if let Ok(mut w) = mx.lock() {
+                let _ = writeln!(w, "{entry}");
+                let _ = w.flush();
+            }
+        }
+    }
+
+    fn is_enabled(&self) -> bool { self.writer.is_some() }
+}
+
+// ── SBus ─────────────────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct SBus {
-    /// Runtime ACP configuration — ablation flags and retry budget.
-    /// Read from environment at startup via AcpConfig::from_env().
-    pub config: AcpConfig,
-    /// Shard registry — 64-bucket DashMap for O(1) concurrent access.
-    registry: Arc<DashMap<String, Shard>>,
-    /// Global commit counter (monotonically increasing).
-    commit_counter: Arc<AtomicU64>,
-    /// Global conflict counter (VersionMismatch + TokenConflict combined).
-    conflict_counter: Arc<AtomicU64>,
-    /// Separate counter for cross-shard stale reads detected by the ACP.
-    /// Exposed via /stats and /metrics so the cross-shard experiment can
-    /// observe the metric directly without parsing log output.
+    pub config:                AcpConfig,
+    registry:                  Arc<SafeMap<Shard>>,
+    token_registry:            Arc<SimpleMap<TokenEntry>>,
+    naive_lock_map:            NaiveLockMap,
+    commit_counter:            Arc<AtomicU64>,
+    conflict_counter:          Arc<AtomicU64>,
     cross_shard_stale_counter: Arc<AtomicU64>,
-    /// Maximum entries retained in each shard's delta log.
-    max_log_depth: usize,
-    /// Token lease timeout in seconds.
-    /// Drives the constructive proof of Corollary 2.2 (liveness):
-    ///   After an agent crashes while holding token τᵢ, the lease monitor
-    ///   detects the orphan within lease_timeout_secs + 5 seconds and sets
-    ///   τᵢ ← ⊥. Therefore at every logical time t + lease_timeout_secs
-    ///   some agent can acquire τᵢ — condition (i) of Corollary 2.2 follows
-    ///   constructively without assuming liveness.
-    pub lease_timeout_secs: u64,
+    max_log_depth:             usize,
+    pub lease_timeout_secs:    u64,
+    wal:                       Arc<Wal>,
 }
 
 impl SBus {
-    pub fn new() -> Self {
-        Self::with_options(1_000, 30)
-    }
+    pub fn new() -> Self { Self::with_options(1_000, 30) }
 
     pub fn with_options(max_log_depth: usize, lease_timeout_secs: u64) -> Self {
         Self {
-            config: AcpConfig::from_env(),
-            registry: Arc::new(DashMap::with_capacity_and_shard_amount(64, 64)),
-            commit_counter: Arc::new(AtomicU64::new(0)),
-            conflict_counter: Arc::new(AtomicU64::new(0)),
+            config:                    AcpConfig::from_env(),
+            registry:                  Arc::new(SafeMap::new()),
+            token_registry:            Arc::new(SimpleMap::new()),
+            naive_lock_map:            Arc::new(RwLock::new(HashMap::new())),
+            commit_counter:            Arc::new(AtomicU64::new(0)),
+            conflict_counter:          Arc::new(AtomicU64::new(0)),
             cross_shard_stale_counter: Arc::new(AtomicU64::new(0)),
             max_log_depth,
             lease_timeout_secs,
+            wal:                       Arc::new(Wal::from_env()),
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Shard CRUD
-    // ─────────────────────────────────────────────────────────────────────
+    // ── CRUD ──────────────────────────────────────────────────────────────────
 
     pub fn create_shard(&self, req: CreateShardRequest) -> Result<ShardResponse, SyncError> {
-        if self.registry.contains_key(&req.key) {
-            return Err(SyncError::ShardNotFound {
-                key: format!("shard '{}' already exists", req.key),
-            });
-        }
         let shard = Shard::new(req.content, req.goal_tag, self.max_log_depth);
-        let resp = ShardResponse::from((req.key.as_str(), &shard));
-        self.registry.insert(req.key, shard);
-        Ok(resp)
+        if !self.registry.insert_if_absent(req.key.clone(), shard) {
+            return Err(SyncError::ShardAlreadyExists { key: req.key });
+        }
+        self.registry
+            .with_entry_read(&req.key, |s| ShardResponse::from((req.key.as_str(), s)))
+            .ok_or_else(|| SyncError::ShardNotFound { key: req.key })
     }
 
     pub fn read_shard(&self, key: &str) -> Result<ShardResponse, SyncError> {
         self.registry
-            .get(key)
-            .map(|s| ShardResponse::from((key, s.value())))
+            .with_entry_read(key, |s| ShardResponse::from((key, s)))
             .ok_or_else(|| SyncError::ShardNotFound { key: key.to_owned() })
     }
 
-    pub fn list_shards(&self) -> Vec<String> {
-        self.registry.iter().map(|r| r.key().clone()).collect()
+    pub fn list_shards(&self) -> Vec<String> { self.registry.keys() }
+
+    // ── Token helpers ─────────────────────────────────────────────────────────
+
+    fn acquire_token(&self, key: &str, agent_id: &str) -> Result<(), SyncError> {
+        self.token_registry
+            .insert_if_absent(key.to_owned(), TokenEntry {
+                owner: agent_id.to_owned(), acquired_at: Utc::now(),
+            })
+            .map_err(|existing| SyncError::TokenConflict {
+                key: key.to_owned(), owner: existing.owner,
+            })
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // ACP — Algorithm 1 (paper §4.2), extended with ablation flags and
-    //        cross-shard sorted-lock-order acquisition (Corollary 2.1)
-    // ─────────────────────────────────────────────────────────────────────
+    fn release_token(&self, key: &str) { self.token_registry.remove(key); }
 
-    /// Atomic Commit Protocol (ACP).
-    ///
-    /// Two paths:
-    ///
-    /// Single-shard (req.read_set is None or empty):
-    ///   Steps 1-5 are ablation-aware. Wrapping each step in the config
-    ///   flag allows Table 11's four ablation conditions to run without
-    ///   recompiling — set SBUS_TOKEN=0 / SBUS_VERSION=0 / SBUS_LOG=0
-    ///   before starting the server.
-    ///
-    /// Multi-shard (req.read_set is Some with entries):
-    ///   Acquires all locks simultaneously in sorted lexicographic key order
-    ///   (Lemma 2 / Havender 1968) before any version check, eliminating
-    ///   the TOCTOU window. Corollary 2.1 holds for any N under Assumption A1.
+    // ── ACP commit — single RwLock, deadlock-free ─────────────────────────────
+
     pub fn commit_delta(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
         let cfg = &self.config;
 
-        // ── Multi-shard path (sorted-lock-order, Corollary 2.1) ──────────
-        if let Some(ref read_set) = req.read_set {
-            if !read_set.is_empty() {
-                // Drop-and-reacquire not used here — we build the sorted key
-                // list first, then acquire all locks simultaneously.
-                let mut all_keys: Vec<String> = read_set
-                    .iter()
-                    .filter(|rs| rs.key != req.key)
-                    .map(|rs| rs.key.clone())
-                    .collect();
-                all_keys.push(req.key.clone());
-                // LEXICOGRAPHIC SORT — Lemma 2 (Havender 1968):
-                // Consistent total order prevents circular wait → no deadlock.
-                all_keys.sort();
-                all_keys.dedup();
-
-                // Acquire all locks in sorted order.
-                // Each get_mut() holds the DashMap per-bucket RwLock until
-                // the RefMut drops. Rust RAII guarantees release on all paths.
-                let mut guards: Vec<dashmap::mapref::one::RefMut<String, Shard>> =
-                    Vec::with_capacity(all_keys.len());
-                for k in &all_keys {
-                    let g = self.registry.get_mut(k).ok_or_else(|| {
-                        SyncError::ShardNotFound { key: k.clone() }
-                    })?;
-                    guards.push(g);
-                }
-
-                // All locks held — validate cross-shard read-set.
-                // No thread can modify any declared shard in this window.
-                for rs_entry in read_set {
-                    if rs_entry.key == req.key {
-                        continue;
-                    }
-                    let idx = all_keys
-                        .iter()
-                        .position(|k| k == &rs_entry.key)
-                        .ok_or_else(|| SyncError::ShardNotFound {
-                            key: rs_entry.key.clone(),
-                        })?;
-                    let current_ver = guards[idx].value().version;
-                    if current_ver != rs_entry.version_at_read {
-                        self.cross_shard_stale_counter.fetch_add(1, Ordering::Relaxed);
-                        return Err(SyncError::CrossShardStale {
-                            key:             rs_entry.key.clone(),
-                            version_at_read: rs_entry.version_at_read,
-                            current_version: current_ver,
-                        });
-                    }
-                }
-
-                // Validate and apply delta on target shard (all locks still held).
-                let target_idx = all_keys
-                    .iter()
-                    .position(|k| k == &req.key)
-                    .ok_or_else(|| SyncError::ShardNotFound {
-                        key: req.key.clone(),
-                    })?;
-                let s_target = guards[target_idx].value_mut();
-                s_target.attempt_count += 1;
-
-                if s_target.version != req.expected_version {
-                    s_target.conflict_count += 1;
-                    self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-                    return Err(SyncError::VersionMismatch {
-                        key:      req.key.clone(),
-                        expected: req.expected_version,
-                        found:    s_target.version,
-                    });
-                }
-                if let Some(ref owner) = s_target.owner {
-                    s_target.conflict_count += 1;
-                    self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-                    return Err(SyncError::TokenConflict {
-                        key:   req.key.clone(),
-                        owner: owner.clone(),
-                    });
-                }
-
-                return self.apply_delta_inner(
-                    s_target, &req.agent_id, &req.delta, &req.key,
-                );
-                // guards dropped here — all locks released via RAII
-            }
-        }
-
-        // ── Single-shard path (ablation-aware) ───────────────────────────
-        // Acquire the single target shard lock.
-        let mut entry = self.registry.get_mut(&req.key).ok_or_else(|| {
-            SyncError::ShardNotFound { key: req.key.clone() }
-        })?;
-        let s = entry.value_mut();
-        s.attempt_count += 1;
-
-        // Step 2 (ablation-aware): version check.
-        // Disabled by SBUS_VERSION=0 — corresponds to –version condition
-        // in Table 11. Without this, agents commit against stale content.
-        if cfg.enable_version_check && s.version != req.expected_version {
-            s.conflict_count += 1;
-            self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-            return Err(SyncError::VersionMismatch {
-                key:      req.key.clone(),
-                expected: req.expected_version,
-                found:    s.version,
+        if cfg.max_delta_chars > 0 && req.delta.len() > cfg.max_delta_chars {
+            return Err(SyncError::DeltaTooLarge {
+                key: req.key.clone(), len: req.delta.len(), max: cfg.max_delta_chars,
             });
         }
 
-        // Step 3 (ablation-aware): ownership token (Ownership Invariant, Def. 5).
-        // Disabled by SBUS_TOKEN=0 — corresponds to –token condition in Table 11.
-        // Without this, two agents can both pass version check if their commits
-        // arrive within the same DashMap lock window.
-        if cfg.enable_ownership_token {
-            if let Some(ref owner) = s.owner {
-                s.conflict_count += 1;
-                self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-                return Err(SyncError::TokenConflict {
-                    key:   req.key.clone(),
-                    owner: owner.clone(),
+        // ── Multi-shard path ──────────────────────────────────────────────────
+        if let Some(ref read_set) = req.read_set {
+            if !read_set.is_empty() {
+                let req_key  = req.key.clone();
+                let agent_id = req.agent_id.clone();
+                let delta    = req.delta.clone();
+                let exp_ver  = req.expected_version;
+                let rs       = read_set.clone();
+                let stale    = self.cross_shard_stale_counter.clone();
+                let conflict = self.conflict_counter.clone();
+                let commits  = self.commit_counter.clone();
+                let tok_reg  = self.token_registry.clone();
+                let wal      = self.wal.clone();
+                let max_log  = self.max_log_depth;
+                let use_tok  = cfg.enable_ownership_token;
+
+                // with_map_write acquires ONE exclusive RwLock write lock.
+                // Returns Result<CommitResponse, SyncError> directly (not Option).
+                return self.registry.with_map_write(|map| {
+                    for rs_entry in &rs {
+                        if rs_entry.key == req_key { continue; }
+                        let s = map.get(&rs_entry.key).ok_or_else(|| {
+                            SyncError::ShardNotFound { key: rs_entry.key.clone() }
+                        })?;
+                        if s.version != rs_entry.version_at_read {
+                            stale.fetch_add(1, Ordering::Relaxed);
+                            return Err(SyncError::CrossShardStale {
+                                key:             rs_entry.key.clone(),
+                                version_at_read: rs_entry.version_at_read,
+                                current_version: s.version,
+                            });
+                        }
+                    }
+
+                    let shard = map.get_mut(&req_key).ok_or_else(|| {
+                        SyncError::ShardNotFound { key: req_key.clone() }
+                    })?;
+                    shard.attempt_count += 1;
+
+                    if shard.version != exp_ver {
+                        shard.conflict_count += 1;
+                        conflict.fetch_add(1, Ordering::Relaxed);
+                        return Err(SyncError::VersionMismatch {
+                            key: req_key.clone(), expected: exp_ver, found: shard.version,
+                        });
+                    }
+
+                    if use_tok {
+                        tok_reg.insert_if_absent(req_key.clone(), TokenEntry {
+                            owner: agent_id.clone(), acquired_at: Utc::now(),
+                        }).map_err(|e| SyncError::TokenConflict {
+                            key: req_key.clone(), owner: e.owner,
+                        })?;
+                    }
+
+                    wal.append(&req_key, shard.version + 1, &agent_id, &delta);
+                    apply_delta(shard, &agent_id, &delta, max_log);
+                    let (nv, sid) = (shard.version, shard.id.clone());
+                    if use_tok { tok_reg.remove(&req_key); }
+                    commits.fetch_add(1, Ordering::Relaxed);
+                    debug!(key = req_key.as_str(), new_version = nv, "multi-shard commit");
+                    Ok(CommitResponse { new_version: nv, shard_id: sid })
                 });
             }
         }
 
-        // Steps 4-5: apply delta with ablation-aware log append.
-        self.apply_delta_inner_cfg(s, &req.agent_id, &req.delta, &req.key, cfg)
-    }
-
-    /// commit_v2_naive — UNORDERED multi-shard commit.
-    ///
-    /// Control condition for the cross-shard validation experiment (Table 6).
-    ///
-    /// Identical to the multi-shard path in commit_delta() EXCEPT that
-    /// `all_keys.sort()` is omitted, so locks are acquired in
-    /// request-insertion order. This can deadlock under adversarial
-    /// concurrency and produces corruptions under concurrent injection.
-    ///
-    /// Purpose: demonstrates empirically that Lemma 2's sorted-lock-order
-    /// is specifically necessary — read-set declaration alone is insufficient.
-    ///
-    /// DO NOT call from production agents.
-    pub fn commit_v2_naive(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
-        let read_set = match &req.read_set {
-            Some(rs) if !rs.is_empty() => rs.clone(),
-            // No read_set — fall through to standard single-shard path
-            _ => return self.commit_delta(req),
-        };
-
-        // Collect keys in REQUEST-INSERTION ORDER — intentionally NOT sorted.
-        // This is the only functional difference from the sorted path.
-        let mut all_keys: Vec<String> = read_set
-            .iter()
-            .filter(|rs| rs.key != req.key)
-            .map(|rs| rs.key.clone())
-            .collect();
-        all_keys.push(req.key.clone());
-        // Note: no all_keys.sort() — intentional, this is the control condition
-        all_keys.dedup();
-
-        // Acquire locks in insertion order (may deadlock under concurrent load)
-        let mut guards: Vec<dashmap::mapref::one::RefMut<String, Shard>> =
-            Vec::with_capacity(all_keys.len());
-        for k in &all_keys {
-            let g = self.registry.get_mut(k).ok_or_else(|| {
-                SyncError::ShardNotFound { key: k.clone() }
-            })?;
-            guards.push(g);
+        // ── Single-shard path — Phase 1: version pre-check ───────────────────
+        // with_entry returns Option<Result<...>>; None means key not found.
+        {
+            let r = self.registry.with_entry(&req.key, |s| {
+                s.attempt_count += 1;
+                if cfg.enable_version_check && s.version != req.expected_version {
+                    s.conflict_count += 1;
+                    self.conflict_counter.fetch_add(1, Ordering::Relaxed);
+                    return Err(SyncError::VersionMismatch {
+                        key: req.key.clone(),
+                        expected: req.expected_version,
+                        found: s.version,
+                    });
+                }
+                Ok(())
+            });
+            match r {
+                None    => return Err(SyncError::ShardNotFound { key: req.key.clone() }),
+                Some(r) => r?,
+            }
         }
 
-        // Cross-shard read-set validation (same logic as sorted path)
-        for rs_entry in &read_set {
-            if rs_entry.key == req.key {
-                continue;
+        // Phase 2: token acquisition.
+        if cfg.enable_ownership_token {
+            self.acquire_token(&req.key, &req.agent_id).map_err(|e| {
+                self.conflict_counter.fetch_add(1, Ordering::Relaxed);
+                e
+            })?;
+        }
+
+        // Phase 3: re-check + apply. with_entry returns Option<Result<...>>.
+        let res = self.registry.with_entry(&req.key, |s| {
+            s.attempt_count += 1;
+            if cfg.enable_version_check && s.version != req.expected_version {
+                s.conflict_count += 1;
+                self.conflict_counter.fetch_add(1, Ordering::Relaxed);
+                return Err(SyncError::VersionMismatch {
+                    key: req.key.clone(),
+                    expected: req.expected_version,
+                    found: s.version,
+                });
             }
-            let idx = all_keys
-                .iter()
-                .position(|k| k == &rs_entry.key)
-                .ok_or_else(|| SyncError::ShardNotFound {
-                    key: rs_entry.key.clone(),
-                })?;
-            let current_ver = guards[idx].value().version;
-            if current_ver != rs_entry.version_at_read {
+            self.wal.append(&req.key, s.version + 1, &req.agent_id, &req.delta);
+            apply_delta_cfg(s, &req.agent_id, &req.delta, cfg, self.max_log_depth);
+            let (nv, sid) = (s.version, s.id.clone());
+            self.commit_counter.fetch_add(1, Ordering::Relaxed);
+            debug!(key = req.key.as_str(), new_version = nv, "single-shard commit");
+            Ok(CommitResponse { new_version: nv, shard_id: sid })
+        });
+
+        if cfg.enable_ownership_token { self.release_token(&req.key); }
+        match res {
+            None    => Err(SyncError::ShardNotFound { key: req.key.clone() }),
+            Some(r) => r,
+        }
+    }
+
+    // ── commit_v2_naive — FIX-1: genuine insertion-order per-shard locking ────
+    //
+    // Acquires one Arc<Mutex<()>> per shard in the INSERTION ORDER of the
+    // read-set (not sorted). When two transactions overlap shards in opposite
+    // orders, each holds one Mutex and blocks waiting for the other → deadlock.
+    //
+    // Example (deadlock at N=2):
+    //   Thread A: key="x", read_set=[{key:"y"}] → acquires x_lock, waits y_lock
+    //   Thread B: key="y", read_set=[{key:"x"}] → acquires y_lock, waits x_lock
+    //
+    // Use naive_deadlock_test.py to reproduce. DO NOT use in production.
+
+    pub fn commit_v2_naive(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
+        let cfg = &self.config;
+
+        if cfg.max_delta_chars > 0 && req.delta.len() > cfg.max_delta_chars {
+            return Err(SyncError::DeltaTooLarge {
+                key: req.key.clone(), len: req.delta.len(), max: cfg.max_delta_chars,
+            });
+        }
+
+        let read_set = req.read_set.clone().unwrap_or_default();
+
+        // Build insertion-order key list — deliberately NOT sorted.
+        let mut ordered_keys: Vec<String> = read_set.iter()
+            .filter(|r| r.key != req.key)
+            .map(|r| r.key.clone())
+            .collect();
+        ordered_keys.push(req.key.clone());
+
+        // Collect Arc<Mutex<()>> for each key (fast, no contention here).
+        let lock_arcs: Vec<Arc<Mutex<()>>> = ordered_keys.iter()
+            .map(|k| get_or_create_naive_lock(&self.naive_lock_map, k))
+            .collect();
+
+        // Acquire each Mutex sequentially in insertion order.
+        // Deadlock possible if another thread holds a complementary subset.
+        // _guards keeps all MutexGuards alive until end of function.
+        let _guards: Vec<std::sync::MutexGuard<'_, ()>> = lock_arcs.iter()
+            .map(|lk| lk.lock().unwrap())
+            .collect();
+
+        // Cross-shard validation (with naive locks held).
+        for rs_entry in &read_set {
+            if rs_entry.key == req.key { continue; }
+            let ver = self.registry
+                .with_entry_read(&rs_entry.key, |s| s.version)
+                .ok_or_else(|| SyncError::ShardNotFound { key: rs_entry.key.clone() })?;
+            if ver != rs_entry.version_at_read {
                 self.cross_shard_stale_counter.fetch_add(1, Ordering::Relaxed);
                 return Err(SyncError::CrossShardStale {
                     key:             rs_entry.key.clone(),
                     version_at_read: rs_entry.version_at_read,
-                    current_version: current_ver,
+                    current_version: ver,
                 });
             }
         }
 
-        // Validate and apply delta on target shard
-        let target_idx = all_keys
-            .iter()
-            .position(|k| k == &req.key)
-            .ok_or_else(|| SyncError::ShardNotFound {
-                key: req.key.clone(),
-            })?;
-        let s_target = guards[target_idx].value_mut();
-        s_target.attempt_count += 1;
-
-        if s_target.version != req.expected_version {
-            s_target.conflict_count += 1;
-            self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-            return Err(SyncError::VersionMismatch {
-                key:      req.key.clone(),
-                expected: req.expected_version,
-                found:    s_target.version,
-            });
-        }
-        if let Some(ref owner) = s_target.owner {
-            s_target.conflict_count += 1;
-            self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-            return Err(SyncError::TokenConflict {
-                key:   req.key.clone(),
-                owner: owner.clone(),
-            });
-        }
-
-        self.apply_delta_inner(s_target, &req.agent_id, &req.delta, &req.key)
-        // guards dropped here — all locks released via RAII
-    }
-
-    /// Inner helper: apply a delta to a shard that has already passed all ACP
-    /// checks. Always enables all ACP features (used by multi-shard paths).
-    /// Called with the DashMap entry lock held.
-    fn apply_delta_inner(
-        &self,
-        s:        &mut Shard,
-        agent_id: &str,
-        delta:    &str,
-        key:      &str,
-    ) -> Result<CommitResponse, SyncError> {
-        s.owner = Some(agent_id.to_owned());
-        s.token_acquired_at = Some(Utc::now());
-
-        let prev_hash = Shard::content_address(&s.content);
-        s.content = delta.to_owned();
-        s.version += 1;
-        s.updated_at = Utc::now();
-
-        s.delta_log.push_back(DeltaEntry {
-            version:      s.version,
-            agent_id:     agent_id.to_owned(),
-            delta:        delta.to_owned(),
-            prev_hash,
-            committed_at: Utc::now(),
+        // Version check + apply. with_entry returns Option<Result<...>>.
+        let res = self.registry.with_entry(&req.key, |s| {
+            s.attempt_count += 1;
+            if s.version != req.expected_version {
+                s.conflict_count += 1;
+                self.conflict_counter.fetch_add(1, Ordering::Relaxed);
+                return Err(SyncError::VersionMismatch {
+                    key: req.key.clone(),
+                    expected: req.expected_version,
+                    found: s.version,
+                });
+            }
+            apply_delta(s, &req.agent_id, &req.delta, self.max_log_depth);
+            let (nv, sid) = (s.version, s.id.clone());
+            self.commit_counter.fetch_add(1, Ordering::Relaxed);
+            Ok(CommitResponse { new_version: nv, shard_id: sid })
         });
-        if s.delta_log.len() > self.max_log_depth {
-            s.delta_log.pop_front();
+        // _guards dropped here — all naive locks released.
+        match res {
+            None    => Err(SyncError::ShardNotFound { key: req.key.clone() }),
+            Some(r) => r,
         }
-
-        let new_version = s.version;
-        let shard_id   = s.id.clone();
-
-        s.owner = None;
-        s.token_acquired_at = None;
-
-        self.commit_counter.fetch_add(1, Ordering::Relaxed);
-        debug!(key, agent = agent_id, new_version, "ACP commit succeeded");
-
-        Ok(CommitResponse { new_version, shard_id })
     }
 
-    /// Ablation-aware inner helper. Respects AcpConfig flags for token,
-    /// version, and log steps. Used by the single-shard path only.
-    fn apply_delta_inner_cfg(
-        &self,
-        s:        &mut Shard,
-        agent_id: &str,
-        delta:    &str,
-        key:      &str,
-        cfg:      &AcpConfig,
-    ) -> Result<CommitResponse, SyncError> {
-        // Acquire write-token (conditional — disabled in –token ablation)
-        if cfg.enable_ownership_token {
-            s.owner = Some(agent_id.to_owned());
-            s.token_acquired_at = Some(Utc::now());
-        }
+    // ── Rollback — FIX-2: TOCTOU-safe + compile-correct ──────────────────────
+    //
+    // BUG IN V18: rollback() called token_registry.snapshot() THEN acquired the
+    // registry write lock separately. An agent could commit in that window,
+    // making the rollback silently overwrite an in-flight commit.
+    //
+    // COMPILE BUG IN engine_v19 first draft: with_map_write returns R (not
+    // Option<R>). The old `match res { None => ..., Some(r) => r }` pattern
+    // from with_entry does NOT apply to with_map_write. Fixed: return
+    // with_map_write(...) directly.
+    //
+    // BORROW BUG: calling self.token_registry inside a closure passed to
+    // self.registry.with_map_write() causes double-borrow of self. Fixed:
+    // extract tok_reg = self.token_registry.clone() before the closure.
 
-        let prev_hash = Shard::content_address(&s.content);
-        s.content = delta.to_owned();
-        s.version += 1;
-        s.updated_at = Utc::now();
+    pub fn rollback(&self, req: RollbackRequest) -> Result<ShardResponse, SyncError> {
+        let key     = req.key.clone();
+        let ml      = self.max_log_depth;
+        // Clone Arc BEFORE with_map_write to avoid double-borrowing self.
+        let tok_reg = self.token_registry.clone();
 
-        // Append to delta log (conditional — disabled in –log ablation).
-        // –log condition: skip append entirely. The shard is still updated;
-        // rollback capability is lost but correctness is not affected.
-        if cfg.enable_delta_log {
-            s.delta_log.push_back(DeltaEntry {
-                version:      s.version,
-                agent_id:     agent_id.to_owned(),
-                delta:        delta.to_owned(),
+        // with_map_write returns Result<ShardResponse, SyncError> directly.
+        // Do NOT wrap in match { None=>..., Some(r)=>r } — that is with_entry pattern.
+        self.registry.with_map_write(|map| {
+            // Token check is now INSIDE the write lock — no TOCTOU window.
+            if req.check_token {
+                let snap = tok_reg.snapshot();
+                if let Some((_, tok)) = snap.iter().find(|(k, _)| k.as_str() == key.as_str()) {
+                    return Err(SyncError::RollbackTokenConflict {
+                        key:   key.clone(),
+                        owner: tok.owner.clone(),
+                    });
+                }
+            }
+
+            let shard = map.get_mut(&key)
+                .ok_or_else(|| SyncError::ShardNotFound { key: key.clone() })?;
+
+            let tgt = shard.delta_log.iter()
+                .find(|e| e.version == req.target_version)
+                .ok_or_else(|| SyncError::Internal {
+                    msg: format!("version {} not in delta log for key={}", req.target_version, key),
+                })?
+                .clone();
+
+            let prev_hash    = Shard::content_address(&shard.content);
+            shard.content    = tgt.delta.clone();
+            shard.version   += 1;
+            shard.updated_at = Utc::now();
+            shard.delta_log.push_back(DeltaEntry {
+                version:      shard.version,
+                agent_id:     format!("rollback:{}", req.agent_id),
+                delta:        tgt.delta,
                 prev_hash,
                 committed_at: Utc::now(),
             });
-            if s.delta_log.len() > self.max_log_depth {
-                s.delta_log.pop_front();
-            }
-        }
-
-        let new_version = s.version;
-        let shard_id   = s.id.clone();
-
-        // Release write-token (conditional — disabled in –token ablation)
-        if cfg.enable_ownership_token {
-            s.owner = None;
-            s.token_acquired_at = None;
-        }
-
-        self.commit_counter.fetch_add(1, Ordering::Relaxed);
-        debug!(key, agent = agent_id, new_version, "ACP commit succeeded (cfg-aware)");
-
-        Ok(CommitResponse { new_version, shard_id })
+            if shard.delta_log.len() > ml { shard.delta_log.pop_front(); }
+            info!(key = key.as_str(), target = req.target_version, "rollback applied");
+            Ok(ShardResponse::from((key.as_str(), &*shard)))
+        })
+        // with_map_write returns the closure return value directly — Result<ShardResponse, SyncError>.
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Rollback
-    // ─────────────────────────────────────────────────────────────────────
-
-    pub fn rollback(&self, req: RollbackRequest) -> Result<ShardResponse, SyncError> {
-        let mut entry = self.registry.get_mut(&req.key).ok_or_else(|| {
-            SyncError::ShardNotFound { key: req.key.clone() }
-        })?;
-        let s = entry.value_mut();
-
-        let target_entry = s
-            .delta_log
-            .iter()
-            .find(|e| e.version == req.target_version)
-            .ok_or_else(|| SyncError::Internal {
-                msg: format!(
-                    "version {} not found in delta log for key={}",
-                    req.target_version, req.key
-                ),
-            })?
-            .clone();
-
-        let prev_hash = Shard::content_address(&s.content);
-        s.content = target_entry.delta.clone();
-        s.version += 1;
-        s.updated_at = Utc::now();
-        s.delta_log.push_back(DeltaEntry {
-            version:      s.version,
-            agent_id:     format!("rollback:{}", req.agent_id),
-            delta:        target_entry.delta,
-            prev_hash,
-            committed_at: Utc::now(),
-        });
-        if s.delta_log.len() > self.max_log_depth {
-            s.delta_log.pop_front();
-        }
-
-        info!(
-            key = req.key,
-            target_version = req.target_version,
-            new_version = s.version,
-            "rollback completed"
-        );
-
-        let resp = ShardResponse::from((req.key.as_str(), &*s));
-        drop(entry);
-        Ok(resp)
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Statistics
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Stats ─────────────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> serde_json::Value {
-        let total_shards    = self.registry.len();
-        let total_commits   = self.commit_counter.load(Ordering::Relaxed);
-        let total_conflicts = self.conflict_counter.load(Ordering::Relaxed);
-        let cross_stale     = self.cross_shard_stale_counter.load(Ordering::Relaxed);
-        let total_attempts  = total_commits + total_conflicts;
-        let scr = if total_attempts > 0 {
-            total_conflicts as f64 / total_attempts as f64
-        } else {
-            0.0
-        };
-
+        let tc = self.commit_counter.load(Ordering::Relaxed);
+        let tf = self.conflict_counter.load(Ordering::Relaxed);
+        let cs = self.cross_shard_stale_counter.load(Ordering::Relaxed);
+        let ta = tc + tf;
         serde_json::json!({
-            "total_shards": total_shards,
-            "total_commits": total_commits,
-            "total_conflicts": total_conflicts,
-            "cross_shard_stale_count": cross_stale,
-            "total_attempts": total_attempts,
-            "scr": scr,
-            "lease_timeout_secs": self.lease_timeout_secs,
-            // Expose ACP config so Python experiments can verify which
-            // ablation condition is active without parsing log output.
+            "total_shards":            self.registry.len(),
+            "total_commits":           tc,
+            "total_conflicts":         tf,
+            "cross_shard_stale_count": cs,
+            "total_attempts":          ta,
+            "scr": if ta > 0 { tf as f64 / ta as f64 } else { 0.0 },
+            "tokens_held":             self.token_registry.len(),
+            "lease_timeout_secs":      self.lease_timeout_secs,
+            "wal_enabled":             self.wal.is_enabled(),
             "acp_config": {
                 "enable_ownership_token": self.config.enable_ownership_token,
                 "enable_version_check":   self.config.enable_version_check,
                 "enable_delta_log":       self.config.enable_delta_log,
                 "retry_budget":           self.config.retry_budget,
-                "lease_timeout_secs":     self.config.lease_timeout_secs,
             },
         })
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Prometheus metrics endpoint (GET /metrics)
-    // ─────────────────────────────────────────────────────────────────────
-
     pub fn prometheus_metrics(&self) -> String {
-        let commits     = self.commit_counter.load(Ordering::Relaxed);
-        let conflicts   = self.conflict_counter.load(Ordering::Relaxed);
-        let cross_stale = self.cross_shard_stale_counter.load(Ordering::Relaxed);
-        let shards      = self.registry.len();
+        let c = self.commit_counter.load(Ordering::Relaxed);
+        let f = self.conflict_counter.load(Ordering::Relaxed);
+        let s = self.cross_shard_stale_counter.load(Ordering::Relaxed);
         format!(
-            "# HELP sbus_commits_total Total successful ACP commits\n\
-             # TYPE sbus_commits_total counter\n\
-             sbus_commits_total {commits}\n\
-             # HELP sbus_conflicts_total Total ACP conflicts (VersionMismatch + TokenConflict)\n\
-             # TYPE sbus_conflicts_total counter\n\
-             sbus_conflicts_total {conflicts}\n\
-             # HELP sbus_cross_shard_stale_total Cross-shard stale reads detected\n\
-             # TYPE sbus_cross_shard_stale_total counter\n\
-             sbus_cross_shard_stale_total {cross_stale}\n\
-             # HELP sbus_shards_total Number of registered shards\n\
-             # TYPE sbus_shards_total gauge\n\
-             sbus_shards_total {shards}\n"
+            "# TYPE sbus_commits_total counter\nsbus_commits_total {c}\n\
+             # TYPE sbus_conflicts_total counter\nsbus_conflicts_total {f}\n\
+             # TYPE sbus_cross_shard_stale_total counter\nsbus_cross_shard_stale_total {s}\n\
+             # TYPE sbus_shards_total gauge\nsbus_shards_total {}\n\
+             # TYPE sbus_tokens_held gauge\nsbus_tokens_held {}\n",
+            self.registry.len(), self.token_registry.len()
         )
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Lease monitor — constructive liveness for Corollary 2.2
-    //
-    // Corollary 2.2 (Liveness under Bounded Contention) requires:
-    //   (i)  retry budget B ≥ 1 (set via SBUS_RETRY_BUDGET, default 1)
-    //   (ii) the lease monitor polls every p = 5 seconds
-    //
-    // This function makes condition (ii) constructive: after an agent crashes
-    // while holding token τᵢ, the monitor detects the orphan within
-    // lease_timeout_secs + 5 seconds and releases τᵢ ← ⊥.
-    // Therefore at every logical time t + lease_timeout_secs some agent can
-    // acquire τᵢ — global progress is guaranteed.
-    // ─────────────────────────────────────────────────────────────────────
-    pub fn spawn_lease_monitor(self) {
-        let lease_secs = self.lease_timeout_secs;
+    pub fn spawn_lease_monitor(&self) {
+        let tr = self.token_registry.clone();
+        let ls = self.lease_timeout_secs;
         tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(5));
+            let mut tick = interval(Duration::from_secs(5));
             loop {
-                ticker.tick().await;
-                let threshold = chrono::Duration::seconds(lease_secs as i64);
+                tick.tick().await;
+                let threshold = chrono::Duration::seconds(ls as i64);
                 let now = Utc::now();
-
-                for mut entry in self.registry.iter_mut() {
-                    let key_str = entry.key().clone();
-                    let shard = entry.value_mut();
-                    if shard.owner.is_none() {
-                        continue;
-                    }
-                    let acquired_at = match shard.token_acquired_at {
-                        Some(t) => t,
-                        None    => continue,
-                    };
-                    if now - acquired_at >= threshold {
-                        warn!(
-                            key   = key_str.as_str(),
-                            owner = ?shard.owner,
-                            "lease expired — releasing write-token and rolling back"
-                        );
-                        if let Some(prev) = shard.delta_log.back() {
-                            shard.content = prev.delta.clone();
-                        }
-                        shard.owner = None;
-                        shard.token_acquired_at = None;
-                    }
-                }
+                tr.retain(|key, entry| {
+                    if entry.acquired_at + threshold <= now {
+                        warn!(key, owner = entry.owner.as_str(), "lease expired — token released");
+                        false
+                    } else { true }
+                });
             }
         });
     }
 }
 
-impl Default for SBus {
-    fn default() -> Self {
-        Self::new()
+impl Default for SBus { fn default() -> Self { Self::new() } }
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn apply_delta(s: &mut Shard, agent_id: &str, delta: &str, max_log: usize) {
+    let prev = Shard::content_address(&s.content);
+    s.content = delta.to_owned(); s.version += 1; s.updated_at = Utc::now();
+    s.delta_log.push_back(DeltaEntry {
+        version: s.version, agent_id: agent_id.to_owned(),
+        delta: delta.to_owned(), prev_hash: prev, committed_at: Utc::now(),
+    });
+    if s.delta_log.len() > max_log { s.delta_log.pop_front(); }
+}
+
+fn apply_delta_cfg(s: &mut Shard, agent_id: &str, delta: &str, cfg: &AcpConfig, max_log: usize) {
+    let prev = Shard::content_address(&s.content);
+    s.content = delta.to_owned(); s.version += 1; s.updated_at = Utc::now();
+    if cfg.enable_delta_log {
+        s.delta_log.push_back(DeltaEntry {
+            version: s.version, agent_id: agent_id.to_owned(),
+            delta: delta.to_owned(), prev_hash: prev, committed_at: Utc::now(),
+        });
+        if s.delta_log.len() > max_log { s.delta_log.pop_front(); }
     }
 }
