@@ -82,7 +82,7 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .with_state(bus);
 
-    let addr = "0.0.0.0:3000";
+    let addr = "0.0.0.0:7000";
     tracing::info!("S-Bus server listening on {addr}");
     tracing::info!(
         "Routes: POST /shard  GET /shard/:key  GET /shards  \
