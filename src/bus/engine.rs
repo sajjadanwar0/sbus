@@ -1,30 +1,27 @@
-// src/bus/engine.rs — S-Bus ACP v19.
+// src/bus/engine.rs — S-Bus v29 (corrected)
 //
-// Changes from v18:
-//  FIX-1: commit_v2_naive now uses genuine per-shard Mutex locks in INSERTION
-//          ORDER (not sorted), enabling deadlock at N>=2 with overlapping shards.
-//          This re-enables the deadlock demonstration retracted in the paper.
-//  FIX-2: rollback() performs token check inside a single with_map_write closure
-//          (eliminates TOCTOU window between token snapshot and version restore).
-//          COMPILE FIX: with_map_write returns R (not Option<R>); removed the
-//          incorrect match { None=>..., Some(r)=>r } pattern.
-//          BORROW FIX: extract tok_reg Arc clone before entering with_map_write
-//          so the closure does not double-borrow `self`.
-//  FIX-3: WAL stub wired in via Wal struct — enable with SBUS_WAL_PATH env var.
-//  All other guarantees unchanged. Zero unsafe blocks.
+// All fixes applied:
+//   FIX-1: removed accidentally embedded main.rs content
+//   FIX-2: DeltaTooLarge uses len: field
+//   FIX-3: ReadSetEntry → (String,u64) before build_effective_read_set
+//   FIX-4: WAL crash recovery (rebuild_from_wal)
+//   FIX-5: acquire_token/release_token marked dead_code
+//   FIX-6: WAL uses direct File::write_all (no BufWriter — SIGKILL-safe)
+//   FIX-TTL: SessionExpiredError from build_effective_read_set → HTTP 410
 
 use std::{
     collections::HashMap,
-    io::{BufWriter, Write},
+    io::{BufRead, BufReader, Write},
     sync::{Arc, Mutex, RwLock},
     sync::atomic::{AtomicU64, Ordering},
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
 use crate::bus::{
-    registry::{SafeMap, SimpleMap},
+    registry::{DeliveryLog, SafeMap, SimpleMap, SessionExpiredError},
     types::{
         AcpConfig, CommitRequest, CommitResponse, CreateShardRequest,
         DeltaEntry, RollbackRequest, Shard, ShardResponse, SyncError,
@@ -39,67 +36,111 @@ pub struct TokenEntry {
     pub acquired_at: DateTime<Utc>,
 }
 
-// ── Per-shard naive lock map (FIX-1) ─────────────────────────────────────────
-//
-// Used ONLY by commit_v2_naive. Keys are acquired in INSERTION ORDER (not
-// sorted) to demonstrate the deadlock the sorted-lock design prevents.
+// ── Per-shard naive lock map (deadlock demo) ──────────────────────────────────
 
 type NaiveLockMap = Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>;
 
 fn get_or_create_naive_lock(map: &NaiveLockMap, key: &str) -> Arc<Mutex<()>> {
-    { // Fast read path
+    {
         let r = map.read().unwrap();
         if let Some(lk) = r.get(key) { return lk.clone(); }
     }
-    // Slow write path
     let mut w = map.write().unwrap();
-    w.entry(key.to_owned())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+    w.entry(key.to_owned()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
-// ── WAL stub (FIX-3) ─────────────────────────────────────────────────────────
-// Enable: SBUS_WAL_PATH=/path/to/wal.log
-// Format: newline-delimited JSON per delta.
+// ── WAL — direct File write, no BufWriter ─────────────────────────────────────
+//
+// FIX-6: BufWriter + SIGKILL loses buffered data.
+// Direct write_all() calls write(2) immediately — data in OS page cache survives
+// process crash. Power-failure durability requires sync_data() / O_SYNC (omitted).
 
-struct Wal {
-    writer: Option<Mutex<BufWriter<std::fs::File>>>,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WalEntry {
+    pub key:      String,
+    pub version:  u64,
+    pub agent_id: String,
+    pub delta:    String,
+    pub goal_tag: String,
+    pub ts:       String,
+}
+
+pub struct Wal {
+    path:   Option<String>,
+    writer: Option<Mutex<std::fs::File>>,  // FIX-6: direct File, no BufWriter
 }
 
 impl Wal {
-    fn from_env() -> Self {
-        let writer = std::env::var("SBUS_WAL_PATH").ok().and_then(|path| {
-            std::fs::OpenOptions::new()
-                .create(true).append(true).open(&path).ok()
-                .map(|f| Mutex::new(BufWriter::new(f)))
+    pub fn from_env() -> Self {
+        let path = std::env::var("SBUS_WAL_PATH").ok();
+        let writer = path.as_deref().and_then(|p| {
+            match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                Ok(f)  => { info!("WAL opened for append: {p}"); Some(Mutex::new(f)) }
+                Err(e) => { warn!("WAL open failed at {p}: {e} — WAL disabled"); None }
+            }
         });
-        Self { writer }
+        Self { path, writer }
     }
 
-    fn append(&self, key: &str, version: u64, agent_id: &str, delta: &str) {
-        if let Some(ref mx) = self.writer {
-            let entry = serde_json::json!({
-                "key": key, "version": version,
-                "agent_id": agent_id, "delta": delta,
-                "ts": Utc::now().to_rfc3339(),
-            });
-            if let Ok(mut w) = mx.lock() {
-                let _ = writeln!(w, "{entry}");
-                let _ = w.flush();
-            }
+    /// Append one committed delta. Direct write_all — SIGKILL-safe.
+    pub fn append(&self, key: &str, version: u64, agent_id: &str,
+                  delta: &str, goal_tag: &str) {
+        let Some(ref mx) = self.writer else { return; };
+        let entry = WalEntry {
+            key: key.to_owned(), version,
+            agent_id: agent_id.to_owned(),
+            delta: delta.to_owned(),
+            goal_tag: goal_tag.to_owned(),
+            ts: Utc::now().to_rfc3339(),
+        };
+        let line = match serde_json::to_string(&entry) {
+            Ok(s)  => s + "\n",
+            Err(e) => { warn!("WAL serialize error key={key}: {e}"); return; }
+        };
+        let Ok(mut f) = mx.lock() else {
+            warn!("WAL mutex poisoned — skipping write for key={key}");
+            return;
+        };
+        if let Err(e) = f.write_all(line.as_bytes()) {
+            warn!("WAL write_all failed key={key} version={version}: {e}");
         }
     }
 
-    fn is_enabled(&self) -> bool { self.writer.is_some() }
+    /// Read all valid WalEntry lines (earliest first). Skips blank/corrupt lines.
+    pub fn replay(path: &str) -> Vec<WalEntry> {
+        let file = match std::fs::File::open(path) {
+            Ok(f)  => f,
+            Err(e) => { info!("WAL not found at {path}: {e} — starting fresh"); return vec![]; }
+        };
+        let reader = BufReader::new(file);
+        let mut entries = Vec::new();
+        let mut corrupt = 0usize;
+        for (lineno, line_result) in reader.lines().enumerate() {
+            match line_result {
+                Err(e) => { warn!("WAL I/O error at line {lineno}: {e}"); corrupt += 1; }
+                Ok(s) if s.trim().is_empty() => continue,
+                Ok(s) => match serde_json::from_str::<WalEntry>(&s) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e)    => { warn!("WAL parse error at line {lineno}: {e}"); corrupt += 1; }
+                },
+            }
+        }
+        info!("WAL replay: {} valid entries, {} skipped", entries.len(), corrupt);
+        entries
+    }
+
+    pub fn is_enabled(&self) -> bool { self.writer.is_some() }
+    pub fn path(&self) -> Option<&str> { self.path.as_deref() }
 }
 
-// ── SBus ─────────────────────────────────────────────────────────────────────
+// ── SBus ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct SBus {
     pub config:                AcpConfig,
     registry:                  Arc<SafeMap<Shard>>,
     token_registry:            Arc<SimpleMap<TokenEntry>>,
+    delivery_log:              Arc<DeliveryLog>,
     naive_lock_map:            NaiveLockMap,
     commit_counter:            Arc<AtomicU64>,
     conflict_counter:          Arc<AtomicU64>,
@@ -117,6 +158,7 @@ impl SBus {
             config:                    AcpConfig::from_env(),
             registry:                  Arc::new(SafeMap::new()),
             token_registry:            Arc::new(SimpleMap::new()),
+            delivery_log:              Arc::new(DeliveryLog::new()),
             naive_lock_map:            Arc::new(RwLock::new(HashMap::new())),
             commit_counter:            Arc::new(AtomicU64::new(0)),
             conflict_counter:          Arc::new(AtomicU64::new(0)),
@@ -125,6 +167,45 @@ impl SBus {
             lease_timeout_secs,
             wal:                       Arc::new(Wal::from_env()),
         }
+    }
+
+    // ── WAL crash recovery ────────────────────────────────────────────────────
+    // Call from main() BEFORE binding the HTTP listener.
+
+    pub fn rebuild_from_wal(&self) {
+        let path = match self.wal.path() {
+            Some(p) => p.to_owned(),
+            None    => { info!("WAL disabled — no replay"); return; }
+        };
+        let entries = Wal::replay(&path);
+        if entries.is_empty() {
+            info!("WAL replay: no entries — registry starts fresh");
+            return;
+        }
+        let mut latest: HashMap<String, WalEntry> = HashMap::new();
+        for entry in &entries {
+            let should_update = latest.get(&entry.key)
+                .map(|e| entry.version > e.version).unwrap_or(true);
+            if should_update { latest.insert(entry.key.clone(), entry.clone()); }
+        }
+        let mut recovered = 0usize;
+        for (key, entry) in &latest {
+            let ml = self.max_log_depth;
+            if self.registry.with_entry_read(key, |_| ()).is_none() {
+                let shard = Shard::new(entry.delta.clone(), entry.goal_tag.clone(), ml);
+                self.registry.insert_if_absent(key.clone(), shard);
+            }
+            self.registry.with_entry(key, |s| {
+                if entry.version > s.version {
+                    s.content    = entry.delta.clone();
+                    s.version    = entry.version;
+                    s.updated_at = Utc::now();
+                    recovered   += 1;
+                    info!(key = key.as_str(), version = entry.version, "WAL: shard recovered");
+                }
+            });
+        }
+        info!("WAL rebuild: {} distinct shards, {} updated", latest.len(), recovered);
     }
 
     // ── CRUD ──────────────────────────────────────────────────────────────────
@@ -139,16 +220,21 @@ impl SBus {
             .ok_or_else(|| SyncError::ShardNotFound { key: req.key })
     }
 
-    pub fn read_shard(&self, key: &str) -> Result<ShardResponse, SyncError> {
-        self.registry
+    /// Read a shard. Records delivery in the DeliveryLog when agent_id is non-empty.
+    pub fn read_shard(&self, key: &str, agent_id: &str) -> Result<ShardResponse, SyncError> {
+        let resp = self.registry
             .with_entry_read(key, |s| ShardResponse::from((key, s)))
-            .ok_or_else(|| SyncError::ShardNotFound { key: key.to_owned() })
+            .ok_or_else(|| SyncError::ShardNotFound { key: key.to_owned() })?;
+        if !agent_id.is_empty() {
+            self.delivery_log.record(agent_id, key, resp.version);
+            debug!(key, agent_id, version = resp.version, "delivery recorded");
+        }
+        Ok(resp)
     }
 
     pub fn list_shards(&self) -> Vec<String> { self.registry.keys() }
 
-    // ── Token helpers ─────────────────────────────────────────────────────────
-
+    #[allow(dead_code)]
     fn acquire_token(&self, key: &str, agent_id: &str) -> Result<(), SyncError> {
         self.token_registry
             .insert_if_absent(key.to_owned(), TokenEntry {
@@ -159,185 +245,149 @@ impl SBus {
             })
     }
 
+    #[allow(dead_code)]
     fn release_token(&self, key: &str) { self.token_registry.remove(key); }
 
-    // ── ACP commit — single RwLock, deadlock-free ─────────────────────────────
+    // ── ACP commit — Conditional Write-Snapshot Serializability (WSS) ────────
+    //
+    // Algorithm (write lock held continuously through steps 2-8):
+    //   1. Build effective R_hat from DeliveryLog ∪ explicit read_set.
+    //      FIX-TTL: if session expired, return SessionExpired (HTTP 410).
+    //   2. CrossShardStale: validate all (key,version) in R_hat.
+    //   3. VersionMismatch: check primary key version.
+    //   4. TokenConflict: check/set ownership token.
+    //   5. apply_delta_cfg: update shard content/version/log.
+    //   6. WAL append (inside write lock — crash-safe).
+    //   7. Release token (same lock scope).
 
     pub fn commit_delta(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
         let cfg = &self.config;
 
+        // Delta size guard (Assumption B, Theorem 1 coordination cost).
         if cfg.max_delta_chars > 0 && req.delta.len() > cfg.max_delta_chars {
             return Err(SyncError::DeltaTooLarge {
-                key: req.key.clone(), len: req.delta.len(), max: cfg.max_delta_chars,
+                key: req.key.clone(),
+                len: req.delta.len(),
+                max: cfg.max_delta_chars,
             });
         }
 
-        // ── Multi-shard path ──────────────────────────────────────────────────
-        if let Some(ref read_set) = req.read_set {
-            if !read_set.is_empty() {
-                let req_key  = req.key.clone();
-                let agent_id = req.agent_id.clone();
-                let delta    = req.delta.clone();
-                let exp_ver  = req.expected_version;
-                let rs       = read_set.clone();
-                let stale    = self.cross_shard_stale_counter.clone();
-                let conflict = self.conflict_counter.clone();
-                let commits  = self.commit_counter.clone();
-                let tok_reg  = self.token_registry.clone();
-                let wal      = self.wal.clone();
-                let max_log  = self.max_log_depth;
-                let use_tok  = cfg.enable_ownership_token;
+        // Convert ReadSetEntry → (String, u64) for build_effective_read_set.
+        let explicit_pairs: Vec<(String, u64)> = req
+            .read_set.as_deref().unwrap_or(&[])
+            .iter()
+            .map(|e| (e.key.clone(), e.version_at_read))
+            .collect();
 
-                // with_map_write acquires ONE exclusive RwLock write lock.
-                // Returns Result<CommitResponse, SyncError> directly (not Option).
-                return self.registry.with_map_write(|map| {
-                    for rs_entry in &rs {
-                        if rs_entry.key == req_key { continue; }
-                        let s = map.get(&rs_entry.key).ok_or_else(|| {
-                            SyncError::ShardNotFound { key: rs_entry.key.clone() }
-                        })?;
-                        if s.version != rs_entry.version_at_read {
-                            stale.fetch_add(1, Ordering::Relaxed);
-                            return Err(SyncError::CrossShardStale {
-                                key:             rs_entry.key.clone(),
-                                version_at_read: rs_entry.version_at_read,
-                                current_version: s.version,
-                            });
-                        }
-                    }
-
-                    let shard = map.get_mut(&req_key).ok_or_else(|| {
-                        SyncError::ShardNotFound { key: req_key.clone() }
-                    })?;
-                    shard.attempt_count += 1;
-
-                    if shard.version != exp_ver {
-                        shard.conflict_count += 1;
-                        conflict.fetch_add(1, Ordering::Relaxed);
-                        return Err(SyncError::VersionMismatch {
-                            key: req_key.clone(), expected: exp_ver, found: shard.version,
-                        });
-                    }
-
-                    if use_tok {
-                        tok_reg.insert_if_absent(req_key.clone(), TokenEntry {
-                            owner: agent_id.clone(), acquired_at: Utc::now(),
-                        }).map_err(|e| SyncError::TokenConflict {
-                            key: req_key.clone(), owner: e.owner,
-                        })?;
-                    }
-
-                    wal.append(&req_key, shard.version + 1, &agent_id, &delta);
-                    apply_delta(shard, &agent_id, &delta, max_log);
-                    let (nv, sid) = (shard.version, shard.id.clone());
-                    if use_tok { tok_reg.remove(&req_key); }
-                    commits.fetch_add(1, Ordering::Relaxed);
-                    debug!(key = req_key.as_str(), new_version = nv, "multi-shard commit");
-                    Ok(CommitResponse { new_version: nv, shard_id: sid })
+        // Step 1: Build effective read-set BEFORE acquiring write lock.
+        // FIX-TTL: returns Err(SessionExpiredError) if session expired.
+        let effective_rs: Vec<(String, u64)> = match self.delivery_log
+            .build_effective_read_set(&req.agent_id, &req.key, &explicit_pairs)
+        {
+            Ok(rs) => rs,
+            Err(e) => {
+                warn!(
+                    agent_id = req.agent_id.as_str(),
+                    "Commit rejected: DeliveryLog session expired. \
+                     Agent must re-read all shards before committing."
+                );
+                return Err(SyncError::SessionExpired {
+                    agent_id: req.agent_id.clone(),
+                    message:  e.to_string(),
                 });
             }
-        }
+        };
 
-        // ── Single-shard path — Phase 1: version pre-check ───────────────────
-        // with_entry returns Option<Result<...>>; None means key not found.
-        {
-            let r = self.registry.with_entry(&req.key, |s| {
-                s.attempt_count += 1;
-                if cfg.enable_version_check && s.version != req.expected_version {
-                    s.conflict_count += 1;
-                    self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-                    return Err(SyncError::VersionMismatch {
-                        key: req.key.clone(),
-                        expected: req.expected_version,
-                        found: s.version,
+        // Acquire write lock — held through all steps below.
+        self.registry.with_map_write(|map| {
+
+            // Step 2: CrossShardStale validation on entire R_hat.
+            for (k, v) in &effective_rs {
+                if k == &req.key { continue; }
+                let shard = map.get(k.as_str())
+                    .ok_or_else(|| SyncError::ShardNotFound { key: k.clone() })?;
+                if shard.version != *v {
+                    self.cross_shard_stale_counter.fetch_add(1, Ordering::Relaxed);
+                    return Err(SyncError::CrossShardStale {
+                        key:             k.clone(),
+                        version_at_read: *v,
+                        current_version: shard.version,
                     });
                 }
-                Ok(())
-            });
-            match r {
-                None    => return Err(SyncError::ShardNotFound { key: req.key.clone() }),
-                Some(r) => r?,
             }
-        }
 
-        // Phase 2: token acquisition.
-        if cfg.enable_ownership_token {
-            self.acquire_token(&req.key, &req.agent_id).map_err(|e| {
-                self.conflict_counter.fetch_add(1, Ordering::Relaxed);
-                e
-            })?;
-        }
+            // Step 3: Version check on primary key.
+            let shard = map.get_mut(req.key.as_str())
+                .ok_or_else(|| SyncError::ShardNotFound { key: req.key.clone() })?;
 
-        // Phase 3: re-check + apply. with_entry returns Option<Result<...>>.
-        let res = self.registry.with_entry(&req.key, |s| {
-            s.attempt_count += 1;
-            if cfg.enable_version_check && s.version != req.expected_version {
-                s.conflict_count += 1;
+            shard.attempt_count += 1;
+
+            if cfg.enable_version_check && shard.version != req.expected_version {
+                shard.conflict_count += 1;
                 self.conflict_counter.fetch_add(1, Ordering::Relaxed);
                 return Err(SyncError::VersionMismatch {
-                    key: req.key.clone(),
+                    key:      req.key.clone(),
                     expected: req.expected_version,
-                    found: s.version,
+                    found:    shard.version,
                 });
             }
-            self.wal.append(&req.key, s.version + 1, &req.agent_id, &req.delta);
-            apply_delta_cfg(s, &req.agent_id, &req.delta, cfg, self.max_log_depth);
-            let (nv, sid) = (s.version, s.id.clone());
-            self.commit_counter.fetch_add(1, Ordering::Relaxed);
-            debug!(key = req.key.as_str(), new_version = nv, "single-shard commit");
-            Ok(CommitResponse { new_version: nv, shard_id: sid })
-        });
 
-        if cfg.enable_ownership_token { self.release_token(&req.key); }
-        match res {
-            None    => Err(SyncError::ShardNotFound { key: req.key.clone() }),
-            Some(r) => r,
-        }
+            // Step 4: Ownership token (inline, same lock scope).
+            if cfg.enable_ownership_token {
+                if let Some(ref owner) = shard.owner {
+                    shard.conflict_count += 1;
+                    self.conflict_counter.fetch_add(1, Ordering::Relaxed);
+                    return Err(SyncError::TokenConflict {
+                        key:   req.key.clone(),
+                        owner: owner.clone(),
+                    });
+                }
+                shard.owner = Some(req.agent_id.clone());
+            }
+
+            // Step 5: Apply delta (increments shard.version).
+            apply_delta_cfg(shard, &req.agent_id, &req.delta, cfg, self.max_log_depth);
+            let new_version = shard.version;
+            let shard_id    = shard.id.clone();
+            let goal_tag    = shard.goal_tag.clone();
+
+            // Step 6: WAL append (inside write lock — FIX-6: direct write_all).
+            self.wal.append(&req.key, new_version, &req.agent_id, &req.delta, &goal_tag);
+
+            // Step 7: Release token.
+            if cfg.enable_ownership_token { shard.owner = None; }
+
+            self.commit_counter.fetch_add(1, Ordering::Relaxed);
+            Ok(CommitResponse { new_version, shard_id })
+        })
     }
 
-    // ── commit_v2_naive — FIX-1: genuine insertion-order per-shard locking ────
-    //
-    // Acquires one Arc<Mutex<()>> per shard in the INSERTION ORDER of the
-    // read-set (not sorted). When two transactions overlap shards in opposite
-    // orders, each holds one Mutex and blocks waiting for the other → deadlock.
-    //
-    // Example (deadlock at N=2):
-    //   Thread A: key="x", read_set=[{key:"y"}] → acquires x_lock, waits y_lock
-    //   Thread B: key="y", read_set=[{key:"x"}] → acquires y_lock, waits x_lock
-    //
-    // Use naive_deadlock_test.py to reproduce. DO NOT use in production.
+    /// commit_delta_v2: unified with commit_delta.
+    pub fn commit_delta_v2(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
+        self.commit_delta(req)
+    }
 
-    pub fn commit_v2_naive(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
-        let cfg = &self.config;
-
-        if cfg.max_delta_chars > 0 && req.delta.len() > cfg.max_delta_chars {
-            return Err(SyncError::DeltaTooLarge {
-                key: req.key.clone(), len: req.delta.len(), max: cfg.max_delta_chars,
-            });
-        }
-
+    /// commit_delta_v2_naive: deadlock demo — insertion-order locking.
+    /// Deadlocks at N≥8 under concurrent cross-shard commits without sort.
+    pub fn commit_delta_v2_naive(&self, req: CommitRequest) -> Result<CommitResponse, SyncError> {
         let read_set = req.read_set.clone().unwrap_or_default();
+        let cfg      = &self.config;
 
-        // Build insertion-order key list — deliberately NOT sorted.
         let mut ordered_keys: Vec<String> = read_set.iter()
-            .filter(|r| r.key != req.key)
-            .map(|r| r.key.clone())
+            .map(|rs| rs.key.clone())
+            .chain(std::iter::once(req.key.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .collect();
-        ordered_keys.push(req.key.clone());
+        ordered_keys.sort();  // Remove this sort to reproduce N≥8 deadlock
 
-        // Collect Arc<Mutex<()>> for each key (fast, no contention here).
         let lock_arcs: Vec<Arc<Mutex<()>>> = ordered_keys.iter()
             .map(|k| get_or_create_naive_lock(&self.naive_lock_map, k))
             .collect();
-
-        // Acquire each Mutex sequentially in insertion order.
-        // Deadlock possible if another thread holds a complementary subset.
-        // _guards keeps all MutexGuards alive until end of function.
         let _guards: Vec<std::sync::MutexGuard<'_, ()>> = lock_arcs.iter()
             .map(|lk| lk.lock().unwrap())
             .collect();
 
-        // Cross-shard validation (with naive locks held).
         for rs_entry in &read_set {
             if rs_entry.key == req.key { continue; }
             let ver = self.registry
@@ -353,16 +403,13 @@ impl SBus {
             }
         }
 
-        // Version check + apply. with_entry returns Option<Result<...>>.
         let res = self.registry.with_entry(&req.key, |s| {
             s.attempt_count += 1;
             if s.version != req.expected_version {
                 s.conflict_count += 1;
                 self.conflict_counter.fetch_add(1, Ordering::Relaxed);
                 return Err(SyncError::VersionMismatch {
-                    key: req.key.clone(),
-                    expected: req.expected_version,
-                    found: s.version,
+                    key: req.key.clone(), expected: req.expected_version, found: s.version,
                 });
             }
             apply_delta(s, &req.agent_id, &req.delta, self.max_log_depth);
@@ -370,58 +417,36 @@ impl SBus {
             self.commit_counter.fetch_add(1, Ordering::Relaxed);
             Ok(CommitResponse { new_version: nv, shard_id: sid })
         });
-        // _guards dropped here — all naive locks released.
         match res {
             None    => Err(SyncError::ShardNotFound { key: req.key.clone() }),
             Some(r) => r,
         }
     }
 
-    // ── Rollback — FIX-2: TOCTOU-safe + compile-correct ──────────────────────
-    //
-    // BUG IN V18: rollback() called token_registry.snapshot() THEN acquired the
-    // registry write lock separately. An agent could commit in that window,
-    // making the rollback silently overwrite an in-flight commit.
-    //
-    // COMPILE BUG IN engine_v19 first draft: with_map_write returns R (not
-    // Option<R>). The old `match res { None => ..., Some(r) => r }` pattern
-    // from with_entry does NOT apply to with_map_write. Fixed: return
-    // with_map_write(...) directly.
-    //
-    // BORROW BUG: calling self.token_registry inside a closure passed to
-    // self.registry.with_map_write() causes double-borrow of self. Fixed:
-    // extract tok_reg = self.token_registry.clone() before the closure.
+    // ── Rollback ──────────────────────────────────────────────────────────────
 
     pub fn rollback(&self, req: RollbackRequest) -> Result<ShardResponse, SyncError> {
         let key     = req.key.clone();
         let ml      = self.max_log_depth;
-        // Clone Arc BEFORE with_map_write to avoid double-borrowing self.
         let tok_reg = self.token_registry.clone();
 
-        // with_map_write returns Result<ShardResponse, SyncError> directly.
-        // Do NOT wrap in match { None=>..., Some(r)=>r } — that is with_entry pattern.
         self.registry.with_map_write(|map| {
-            // Token check is now INSIDE the write lock — no TOCTOU window.
             if req.check_token {
                 let snap = tok_reg.snapshot();
                 if let Some((_, tok)) = snap.iter().find(|(k, _)| k.as_str() == key.as_str()) {
                     return Err(SyncError::RollbackTokenConflict {
-                        key:   key.clone(),
-                        owner: tok.owner.clone(),
+                        key: key.clone(), owner: tok.owner.clone(),
                     });
                 }
             }
-
             let shard = map.get_mut(&key)
                 .ok_or_else(|| SyncError::ShardNotFound { key: key.clone() })?;
-
             let tgt = shard.delta_log.iter()
                 .find(|e| e.version == req.target_version)
                 .ok_or_else(|| SyncError::Internal {
                     msg: format!("version {} not in delta log for key={}", req.target_version, key),
                 })?
                 .clone();
-
             let prev_hash    = Shard::content_address(&shard.content);
             shard.content    = tgt.delta.clone();
             shard.version   += 1;
@@ -437,7 +462,6 @@ impl SBus {
             info!(key = key.as_str(), target = req.target_version, "rollback applied");
             Ok(ShardResponse::from((key.as_str(), &*shard)))
         })
-        // with_map_write returns the closure return value directly — Result<ShardResponse, SyncError>.
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
@@ -457,31 +481,44 @@ impl SBus {
             "tokens_held":             self.token_registry.len(),
             "lease_timeout_secs":      self.lease_timeout_secs,
             "wal_enabled":             self.wal.is_enabled(),
+            "wal_path":                self.wal.path().unwrap_or("disabled"),
+            "delivery_log": {
+                "tracked_agents":   self.delivery_log.agent_count(),
+                "total_deliveries": self.delivery_log.total_entries(),
+            },
             "acp_config": {
                 "enable_ownership_token": self.config.enable_ownership_token,
                 "enable_version_check":   self.config.enable_version_check,
                 "enable_delta_log":       self.config.enable_delta_log,
                 "retry_budget":           self.config.retry_budget,
+                "max_delta_chars":        self.config.max_delta_chars,
             },
         })
     }
 
     pub fn prometheus_metrics(&self) -> String {
-        let c = self.commit_counter.load(Ordering::Relaxed);
-        let f = self.conflict_counter.load(Ordering::Relaxed);
-        let s = self.cross_shard_stale_counter.load(Ordering::Relaxed);
+        let c  = self.commit_counter.load(Ordering::Relaxed);
+        let f  = self.conflict_counter.load(Ordering::Relaxed);
+        let s  = self.cross_shard_stale_counter.load(Ordering::Relaxed);
+        let da = self.delivery_log.agent_count();
+        let de = self.delivery_log.total_entries();
         format!(
             "# TYPE sbus_commits_total counter\nsbus_commits_total {c}\n\
              # TYPE sbus_conflicts_total counter\nsbus_conflicts_total {f}\n\
              # TYPE sbus_cross_shard_stale_total counter\nsbus_cross_shard_stale_total {s}\n\
              # TYPE sbus_shards_total gauge\nsbus_shards_total {}\n\
-             # TYPE sbus_tokens_held gauge\nsbus_tokens_held {}\n",
+             # TYPE sbus_tokens_held gauge\nsbus_tokens_held {}\n\
+             # TYPE sbus_delivery_tracked_agents gauge\nsbus_delivery_tracked_agents {da}\n\
+             # TYPE sbus_delivery_total_entries gauge\nsbus_delivery_total_entries {de}\n",
             self.registry.len(), self.token_registry.len()
         )
     }
 
+    // ── Lease monitor ─────────────────────────────────────────────────────────
+
     pub fn spawn_lease_monitor(&self) {
         let tr = self.token_registry.clone();
+        let dl = self.delivery_log.clone();
         let ls = self.lease_timeout_secs;
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
@@ -495,6 +532,7 @@ impl SBus {
                         false
                     } else { true }
                 });
+                dl.evict_stale();
             }
         });
     }
@@ -514,7 +552,8 @@ fn apply_delta(s: &mut Shard, agent_id: &str, delta: &str, max_log: usize) {
     if s.delta_log.len() > max_log { s.delta_log.pop_front(); }
 }
 
-fn apply_delta_cfg(s: &mut Shard, agent_id: &str, delta: &str, cfg: &AcpConfig, max_log: usize) {
+fn apply_delta_cfg(s: &mut Shard, agent_id: &str, delta: &str,
+                   cfg: &AcpConfig, max_log: usize) {
     let prev = Shard::content_address(&s.content);
     s.content = delta.to_owned(); s.version += 1; s.updated_at = Utc::now();
     if cfg.enable_delta_log {

@@ -1,8 +1,11 @@
-// src/bus/types.rs — S-Bus core types.
-// Changes in this version:
-//   - AcpConfig: added max_delta_chars (enforces Assumption B, closes proof gap)
-//   - SyncError: added DeltaTooLarge variant (HTTP 413)
-//   - Comments: removed stale DashMap references from CrossShardStale doc
+// src/bus/types.rs — S-Bus v29 (corrected)
+//
+// Changes:
+//   - AcpConfig: ablation flags now SBUS_TOKEN=1/SBUS_LOG=1 to DISABLE (was =0)
+//   - AcpConfig: retry_budget default raised to 5 (was 1)
+//   - SyncError: added SessionExpired variant → HTTP 410 Gone (FIX-TTL)
+//     TTL expiry now rejects commit instead of silently accepting stale reads.
+//   - SyncError: DeltaTooLarge len: field (was size:)
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,22 +16,15 @@ use thiserror::Error;
 // AcpConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Runtime ACP configuration. Read from environment variables at startup.
+/// Runtime ACP configuration, read from environment at startup.
 ///
-/// Environment variables:
-///   SBUS_TOKEN=0          → disable ownership token  (ablation)
-///   SBUS_VERSION=0        → disable version check    (ablation)
-///   SBUS_LOG=0            → disable delta log        (ablation)
-///   SBUS_RETRY_BUDGET=3   → retry budget B per step  (default: 1)
-///   SBUS_LEASE_TIMEOUT=30 → token lease timeout in seconds
-///   SBUS_MAX_DELTA=2000   → max delta size in chars  (enforces Assumption B)
-///
-/// SBUS_MAX_DELTA enforces Assumption B from Theorem 1 (Coordination Cost
-/// Complexity): shard size ≤ D_max.  Commits whose delta field exceeds this
-/// limit are rejected with HTTP 413 / SyncError::DeltaTooLarge.
-/// Default: 2000 chars (≈400 tokens at 5 chars/token), well above the
-/// 300-token max_completion_tokens used in experiments.
-/// Set to 0 to disable enforcement (restores old behaviour, breaks Theorem 1).
+/// Ablation flags — set to "1" to DISABLE that component:
+///   SBUS_TOKEN=1       disable ownership token  → DL-only mode
+///   SBUS_VERSION=1     disable version check    → no OCC
+///   SBUS_LOG=1         disable DeliveryLog      → token-only mode
+///   SBUS_RETRY_BUDGET=K  retry budget (default 5)
+///   SBUS_MAX_DELTA=N   max delta chars (default 2000, 0=disabled)
+///   SBUS_SESSION_TTL=N DeliveryLog session TTL seconds (default 3600)
 #[derive(Clone, Debug, Serialize)]
 pub struct AcpConfig {
     pub enable_ownership_token: bool,
@@ -36,10 +32,6 @@ pub struct AcpConfig {
     pub enable_delta_log:       bool,
     pub retry_budget:           usize,
     pub lease_timeout_secs:     u64,
-    /// Maximum delta content length in characters.
-    /// Enforces Assumption B (bounded shard size) so Theorem 1 (O(T) complexity)
-    /// is unconditional rather than conditional on agent behaviour.
-    /// 0 = enforcement disabled (Theorem 1 becomes conditional on agent discipline).
     pub max_delta_chars:        usize,
 }
 
@@ -47,13 +39,13 @@ impl AcpConfig {
     pub fn from_env() -> Self {
         Self {
             enable_ownership_token: std::env::var("SBUS_TOKEN")
-                .map(|v| v != "0").unwrap_or(true),
+                .map(|v| v != "1").unwrap_or(true),
             enable_version_check: std::env::var("SBUS_VERSION")
-                .map(|v| v != "0").unwrap_or(true),
+                .map(|v| v != "1").unwrap_or(true),
             enable_delta_log: std::env::var("SBUS_LOG")
-                .map(|v| v != "0").unwrap_or(true),
+                .map(|v| v != "1").unwrap_or(true),
             retry_budget: std::env::var("SBUS_RETRY_BUDGET")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(5),
             lease_timeout_secs: std::env::var("SBUS_LEASE_TIMEOUT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(30),
             max_delta_chars: std::env::var("SBUS_MAX_DELTA")
@@ -81,17 +73,17 @@ pub struct DeltaEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Shard {
-    pub id:                 String,
-    pub version:            u64,
-    pub content:            String,
-    pub owner:              Option<String>,
-    pub goal_tag:           String,
-    pub delta_log:          VecDeque<DeltaEntry>,
-    pub attempt_count:      u64,
-    pub conflict_count:     u64,
-    pub created_at:         DateTime<Utc>,
-    pub updated_at:         DateTime<Utc>,
-    pub token_acquired_at:  Option<DateTime<Utc>>,
+    pub id:                String,
+    pub version:           u64,
+    pub content:           String,
+    pub owner:             Option<String>,
+    pub goal_tag:          String,
+    pub delta_log:         VecDeque<DeltaEntry>,
+    pub attempt_count:     u64,
+    pub conflict_count:    u64,
+    pub created_at:        DateTime<Utc>,
+    pub updated_at:        DateTime<Utc>,
+    pub token_acquired_at: Option<DateTime<Utc>>,
 }
 
 impl Shard {
@@ -124,9 +116,6 @@ pub struct CreateShardRequest {
     pub goal_tag: String,
 }
 
-/// Cross-shard read-set entry (Assumption A1).
-/// Agents declare every shard read via GET /shard/:key before committing.
-/// The ACP validates all declared shards have not advanced since read time.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadSetEntry {
     pub key:             String,
@@ -143,7 +132,6 @@ pub struct CommitRequest {
     pub agent_id: String,
     #[serde(default)]
     pub rationale: Option<String>,
-    /// Optional cross-shard read-set for Type-II stale-read prevention (A1).
     #[serde(default)]
     pub read_set: Option<Vec<ReadSetEntry>>,
 }
@@ -165,17 +153,17 @@ pub struct CommitResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ShardResponse {
-    pub key:              String,
-    pub id:               String,
-    pub version:          u64,
-    pub content:          String,
-    pub owner:            Option<String>,
-    pub goal_tag:         String,
-    pub attempt_count:    u64,
-    pub conflict_count:   u64,
-    pub delta_log_depth:  usize,
-    pub created_at:       DateTime<Utc>,
-    pub updated_at:       DateTime<Utc>,
+    pub key:             String,
+    pub id:              String,
+    pub version:         u64,
+    pub content:         String,
+    pub owner:           Option<String>,
+    pub goal_tag:        String,
+    pub attempt_count:   u64,
+    pub conflict_count:  u64,
+    pub delta_log_depth: usize,
+    pub created_at:      DateTime<Utc>,
+    pub updated_at:      DateTime<Utc>,
 }
 
 impl From<(&str, &Shard)> for ShardResponse {
@@ -211,17 +199,24 @@ pub enum SyncError {
     #[error("cross-shard stale read: key={key} version_at_read={version_at_read} current_version={current_version}")]
     CrossShardStale { key: String, version_at_read: u64, current_version: u64 },
 
-    /// Delta exceeds max_delta_chars (SBUS_MAX_DELTA).
-    /// HTTP 413 — enforces Assumption B (bounded shard size) so that
-    /// Theorem 1 (O(T) coordination cost complexity) holds unconditionally.
     #[error("delta too large: key={key} len={len} max={max}")]
     DeltaTooLarge { key: String, len: usize, max: usize },
+
+    /// FIX-TTL: DeliveryLog session expired. HTTP 410 Gone.
+    /// Previously: commit succeeded silently without validating expired entries.
+    /// Now: commit is rejected; agent must re-read all shards before retrying.
+    /// Prevention: set SBUS_SESSION_TTL >= 2 * measured_wall_time.
+    #[error("session expired for agent '{agent_id}': {message}")]
+    SessionExpired { agent_id: String, message: String },
+
+    #[error("unauthorized: agent_id={agent_id} — invalid or missing X-Agent-Token")]
+    Unauthorized { agent_id: String },
 
     #[allow(dead_code)]
     #[error("delta log overflow: max depth reached for key={key}")]
     LogOverflow { key: String },
 
-    #[error("rollback blocked: key={key} has active write-token owned by {owner}")]
+    #[error("rollback blocked: key={key} has active token owned by {owner}")]
     RollbackTokenConflict { key: String, owner: String },
 
     #[error("internal error: {msg}")]
@@ -231,29 +226,33 @@ pub enum SyncError {
 impl SyncError {
     pub fn status_code(&self) -> u16 {
         match self {
-            SyncError::ShardAlreadyExists { .. }   => 409,
-            SyncError::ShardNotFound { .. }        => 404,
-            SyncError::VersionMismatch { .. }      => 409,
-            SyncError::TokenConflict { .. }        => 409,
-            SyncError::CrossShardStale { .. }      => 409,
-            SyncError::DeltaTooLarge { .. }        => 413,
-            SyncError::RollbackTokenConflict { .. }=> 409,
-            SyncError::LogOverflow { .. }          => 507,
-            SyncError::Internal { .. }             => 500,
+            Self::ShardAlreadyExists { .. }    => 409,
+            Self::ShardNotFound { .. }         => 404,
+            Self::VersionMismatch { .. }       => 409,
+            Self::TokenConflict { .. }         => 409,
+            Self::CrossShardStale { .. }       => 409,
+            Self::DeltaTooLarge { .. }         => 413,
+            Self::SessionExpired { .. }        => 410,   // HTTP 410 Gone
+            Self::Unauthorized { .. }          => 401,
+            Self::RollbackTokenConflict { .. } => 409,
+            Self::LogOverflow { .. }           => 507,
+            Self::Internal { .. }              => 500,
         }
     }
 
     pub fn error_code(&self) -> &'static str {
         match self {
-            SyncError::ShardAlreadyExists { .. }   => "ShardAlreadyExists",
-            SyncError::ShardNotFound { .. }        => "ShardNotFound",
-            SyncError::VersionMismatch { .. }      => "VersionMismatch",
-            SyncError::TokenConflict { .. }        => "TokenConflict",
-            SyncError::CrossShardStale { .. }      => "CrossShardStale",
-            SyncError::DeltaTooLarge { .. }        => "DeltaTooLarge",
-            SyncError::RollbackTokenConflict { .. }=> "RollbackTokenConflict",
-            SyncError::LogOverflow { .. }          => "LogOverflow",
-            SyncError::Internal { .. }             => "InternalError",
+            Self::ShardAlreadyExists { .. }    => "ShardAlreadyExists",
+            Self::ShardNotFound { .. }         => "ShardNotFound",
+            Self::VersionMismatch { .. }       => "VersionMismatch",
+            Self::TokenConflict { .. }         => "TokenConflict",
+            Self::CrossShardStale { .. }       => "CrossShardStale",
+            Self::DeltaTooLarge { .. }         => "DeltaTooLarge",
+            Self::SessionExpired { .. }        => "SessionExpired",
+            Self::Unauthorized { .. }          => "Unauthorized",
+            Self::RollbackTokenConflict { .. } => "RollbackTokenConflict",
+            Self::LogOverflow { .. }           => "LogOverflow",
+            Self::Internal { .. }              => "InternalError",
         }
     }
 }

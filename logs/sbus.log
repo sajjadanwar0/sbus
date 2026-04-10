@@ -1,0 +1,20 @@
+[2m2026-04-09T04:48:35.950889Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m S-Bus v29 — ACP config loaded [3mtoken[0m[2m=[0mtrue [3mversion[0m[2m=[0mtrue [3mlog[0m[2m=[0mtrue [3mretry_budget[0m[2m=[0m1 [3mlease_secs[0m[2m=[0m7200 [3mwal[0m[2m=[0m"/home/neo/RustroverProjects/sbus/results/wal.jsonl" [3mhmac[0m[2m=[0mfalse
+[2m2026-04-09T04:48:35.950945Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m DeliveryLog: active (A1 server-enforced for HTTP reads). WSS: write-write + R_obs stale-read elimination.
+[2m2026-04-09T04:48:35.950962Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m Ablation flags: SBUS_TOKEN=0 | SBUS_VERSION=0 | SBUS_LOG=0 | SBUS_RETRY_BUDGET=N
+[2m2026-04-09T04:48:35.950972Z[0m [33m WARN[0m [2msbus_server[0m[2m:[0m HMAC agent authentication: DISABLED (single-tenant / dev mode). Set SBUS_HMAC_KEY for multi-tenant or untrusted deployments.
+[2m2026-04-09T04:48:35.950980Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m WAL crash recovery: starting replay...
+[2m2026-04-09T04:48:35.951002Z[0m [32m INFO[0m [2msbus_server::bus::engine[0m[2m:[0m WAL replay: 0 valid entries, 0 skipped
+[2m2026-04-09T04:48:35.951011Z[0m [32m INFO[0m [2msbus_server::bus::engine[0m[2m:[0m WAL replay: no entries — registry starts fresh
+[2m2026-04-09T04:48:35.951019Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m WAL crash recovery: complete.
+[2m2026-04-09T04:48:35.951154Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m S-Bus v29 listening on 0.0.0.0:7000
+[2m2026-04-09T05:08:04.691160Z[0m [32m INFO[0m [2msbus_server::bus::engine[0m[2m:[0m WAL opened for append: /home/neo/RustroverProjects/sbus/results/wal.jsonl
+[2m2026-04-09T05:08:04.691238Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m S-Bus v29 — ACP config loaded [3mtoken[0m[2m=[0mtrue [3mversion[0m[2m=[0mtrue [3mlog[0m[2m=[0mtrue [3mretry_budget[0m[2m=[0m1 [3mlease_secs[0m[2m=[0m7200 [3mwal[0m[2m=[0m"/home/neo/RustroverProjects/sbus/results/wal.jsonl" [3mhmac[0m[2m=[0mfalse
+[2m2026-04-09T05:08:04.691276Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m DeliveryLog: active (A1 server-enforced for HTTP reads). WSS: write-write + R_obs stale-read elimination.
+[2m2026-04-09T05:08:04.691287Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m Ablation flags: SBUS_TOKEN=0 | SBUS_VERSION=0 | SBUS_LOG=0 | SBUS_RETRY_BUDGET=N
+[2m2026-04-09T05:08:04.691297Z[0m [33m WARN[0m [2msbus_server[0m[2m:[0m HMAC agent authentication: DISABLED (single-tenant / dev mode). Set SBUS_HMAC_KEY for multi-tenant or untrusted deployments.
+[2m2026-04-09T05:08:04.691308Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m WAL crash recovery: starting replay...
+[2m2026-04-09T05:08:04.691395Z[0m [32m INFO[0m [2msbus_server::bus::engine[0m[2m:[0m WAL replay: 1 valid entries, 0 skipped
+[2m2026-04-09T05:08:04.691442Z[0m [32m INFO[0m [2msbus_server::bus::engine[0m[2m:[0m WAL: shard recovered [3mkey[0m[2m=[0m"wal_smoke_test_shard" [3mversion[0m[2m=[0m1
+[2m2026-04-09T05:08:04.691453Z[0m [32m INFO[0m [2msbus_server::bus::engine[0m[2m:[0m WAL rebuild: 1 distinct shards, 1 updated
+[2m2026-04-09T05:08:04.691464Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m WAL crash recovery: complete.
+[2m2026-04-09T05:08:04.691623Z[0m [32m INFO[0m [2msbus_server[0m[2m:[0m S-Bus v29 listening on 0.0.0.0:7000
