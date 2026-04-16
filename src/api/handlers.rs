@@ -1,262 +1,424 @@
-// src/api/handlers.rs — S-Bus v29 (Rust edition 2024)
+// src/api/handlers.rs — S-Bus v36 Raft-backed handlers
 //
-// HMAC-SHA256 is implemented directly using sha2 (RFC 2104).
-// This avoids the hmac crate version / trait-scope issues entirely.
-// sha2 is already in Cargo.toml and compiles cleanly.
-//
-// DEPLOYMENT:
-//   export SBUS_HMAC_KEY=$(openssl rand -hex 32)
-//
-//   # Python agent — sign agent_id before every commit:
-//   import hmac, hashlib, os
-//   def make_token(agent_id: str) -> str:
-//       key = os.environ["SBUS_HMAC_KEY"].encode()
-//       return hmac.new(key, agent_id.encode(), hashlib.sha256).hexdigest()
-//   headers = {"X-Agent-Token": make_token("agent-1")}
+// Key change: create_shard now routes through Raft client_write so that
+// shard creation is replicated to all nodes. Single-node mode is unchanged.
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 
-use crate::bus::{
-    engine::SBus,
-    types::{CommitRequest, CreateShardRequest, RollbackRequest, SyncError},
+use crate::{
+    bus::{
+        engine::SBus,
+        types::{CommitRequest, CreateShardRequest, RollbackRequest},
+    },
+    cluster::{ClusterConfig, post_json},
+    raft::{CommitEntry, SBusRaft},
 };
 
-// ── HMAC-SHA256 (RFC 2104) implemented with sha2 only ────────────────────────
-//
-// We implement HMAC directly rather than depending on the `hmac` crate,
-// which has unstable trait-import requirements across editions (the
-// `KeyInit::new_from_slice` path breaks in Rust 2024 without exact imports).
-//
-// HMAC(key, msg) = H( (key XOR opad) || H( (key XOR ipad) || msg ) )
-//   where H = SHA-256, ipad = 0x36 * 64, opad = 0x5c * 64
-
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-
-    const BLOCK: usize = 64; // SHA-256 block size in bytes
-
-    // Step 1: normalize key to exactly BLOCK bytes.
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        // Key longer than block → hash it first.
-        let hashed = Sha256::digest(key);
-        k[..32].copy_from_slice(&hashed);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-        // remaining bytes are already 0 (zero-padding).
-    }
-
-    // Step 2: derive inner and outer padded keys.
-    let mut ipad = [0u8; BLOCK];
-    let mut opad = [0u8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] = k[i] ^ 0x36;
-        opad[i] = k[i] ^ 0x5c;
-    }
-
-    // Step 3: inner hash = H(ipad || message).
-    let inner = {
-        let mut h = Sha256::new();
-        h.update(ipad);
-        h.update(message);
-        h.finalize()
-    };
-
-    // Step 4: outer hash = H(opad || inner).
-    let outer = {
-        let mut h = Sha256::new();
-        h.update(opad);
-        h.update(inner);
-        h.finalize()
-    };
-
-    outer.into()
+// ── AppState ──────────────────────────────────────────────────────────────────
+pub struct AppState {
+    pub bus:           SBus,
+    pub cluster:       ClusterConfig,
+    pub raft:          Option<SBusRaft>,
+    pub node_id:       u64,
+    pub this_url:      String,
+    pub admin_enabled: bool,
 }
 
-// ── HMAC helpers ──────────────────────────────────────────────────────────────
+impl AppState {
+    /// URL of the current leader node, or None if WE are the leader.
+    pub fn leader_url(&self) -> Option<String> {
+        let raft = self.raft.as_ref()?;
+        let m    = raft.metrics().borrow().clone();
+        let lid  = m.current_leader?;
+        if lid == self.node_id { return None; }
+        let cfg  = m.membership_config;
+        cfg.membership().get_node(&lid).map(|n| n.addr.clone())
+    }
 
-fn hmac_key() -> Option<Vec<u8>> {
-    std::env::var("SBUS_HMAC_KEY").ok().map(|s| s.into_bytes())
+    pub fn is_leader(&self) -> bool {
+        // Explicit type on closure param avoids E0282
+        self.raft.as_ref().map(|r: &SBusRaft| {
+            r.metrics().borrow().current_leader == Some(self.node_id)
+        }).unwrap_or(true)
+    }
 }
 
-/// Verify X-Agent-Token header for write operations (commit, rollback).
-///
-/// - SBUS_HMAC_KEY not set → always Ok (dev / single-tenant mode).
-/// - SBUS_HMAC_KEY set     → header must equal hex(HMAC-SHA256(key, agent_id)).
-/// - GET /shard reads do NOT require HMAC.
-fn verify_agent_hmac(headers: &HeaderMap, agent_id: &str) -> Result<(), SyncError> {
-    let Some(key) = hmac_key() else {
-        return Ok(()); // HMAC disabled — backwards-compatible
+// ── POST /shard ───────────────────────────────────────────────────────────────
+// In single-node mode: direct write (same as before).
+// In Raft mode: route through client_write so ALL nodes replicate the creation.
+// This fixes the bug where create_shard only wrote to the local registry.
+pub async fn create_shard(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<CreateShardRequest>,
+) -> impl IntoResponse {
+    // ── Single-node mode: direct write ───────────────────────────────────────
+    let Some(ref raft) = state.raft else {
+        return match state.bus.create_shard(req) {
+            Ok(r)  => (StatusCode::CREATED, Json(serde_json::to_value(r).unwrap())),
+            Err(e) => {
+                let sc = StatusCode::from_u16(e.status_code())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (sc, Json(json!({"error": e.error_code(), "detail": e.to_string()})))
+            }
+        };
     };
 
-    let token = headers
-        .get("x-agent-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    // ── Raft mode: forward to leader if we are not leader ────────────────────
+    if !state.is_leader() {
+        if let Some(url) = state.leader_url() {
+            let full = format!("{url}/shard");
+            return match post_json(&state.cluster.client, &full, &req).await {
+                Ok((s, b)) => {
+                    let sc = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY);
+                    (sc, Json(b))
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                           Json(json!({"error": "leader_forward_failed", "detail": e}))),
+            };
+        }
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "no_leader", "detail": "cluster has no leader yet"})));
+    }
 
-    let expected = hex::encode(hmac_sha256(&key, agent_id.as_bytes()));
+    // ── We are leader: propose CreateShard through Raft log ──────────────────
+    // CommitEntry with init_content signals the state machine to call
+    // create_shard on every node that applies this entry. The delta and
+    // expected_version fields are unused for creation (set to sentinel values).
+    let entry = CommitEntry {
+        key:              req.key.clone(),
+        expected_version: 0,
+        delta:            String::new(),      // unused for creation
+        agent_id:         "system".to_string(),
+        read_set:         vec![],
+        init_content:     Some(req.content.clone()),
+        init_goal_tag:    Some(req.goal_tag.clone()),
+    };
 
-    // Constant-time comparison — prevents timing-oracle attacks.
-    if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-        return Err(SyncError::Unauthorized {
-            agent_id: agent_id.to_owned(),
+    match raft.client_write(entry).await {
+        Ok(_) => (StatusCode::CREATED, Json(json!({
+            "key":    req.key,
+            "status": "created",
+            "via":    "raft",
+        }))),
+        Err(e) => {
+            let msg = format!("{e}");
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(json!({"error": "raft_write_failed", "detail": msg})))
+        }
+    }
+}
+
+// ── GET /shard/:key ───────────────────────────────────────────────────────────
+#[derive(Deserialize)]
+pub struct AgentQuery { #[serde(default)] pub agent_id: String }
+
+pub async fn get_shard(
+    State(state): State<Arc<AppState>>,
+    Path(key):    Path<String>,
+    Query(q):     Query<AgentQuery>,
+) -> impl IntoResponse {
+    match state.bus.read_shard(&key, &q.agent_id) {
+        Ok(r)  => (StatusCode::OK, Json(serde_json::to_value(r).unwrap())),
+        Err(e) => {
+            let sc = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (sc, Json(json!({"error": e.error_code(), "detail": e.to_string()})))
+        }
+    }
+}
+
+pub async fn list_shards(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let keys = state.bus.list_shards();
+    (StatusCode::OK, Json(json!({"shards": keys, "count": keys.len()})))
+}
+
+// ── POST /commit/v2 ───────────────────────────────────────────────────────────
+pub async fn commit_v2(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<CommitRequest>,
+) -> impl IntoResponse {
+    // ── Single-node: no Raft ──────────────────────────────────────────────────
+    let Some(ref raft) = state.raft else {
+        return match state.bus.commit_delta_v2(req) {
+            Ok(r)  => (StatusCode::OK, Json(serde_json::to_value(r).unwrap())),
+            Err(e) => {
+                let sc = StatusCode::from_u16(e.status_code())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (sc, Json(json!({"error": e.error_code(), "detail": e.to_string()})))
+            }
+        };
+    };
+
+    // ── Raft: forward to leader if needed ─────────────────────────────────────
+    if !state.is_leader() {
+        if let Some(url) = state.leader_url() {
+            let full = format!("{url}/commit/v2");
+            return match post_json(&state.cluster.client, &full, &req).await {
+                Ok((s, b)) => {
+                    let sc = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY);
+                    (sc, Json(b))
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                           Json(json!({"error": "leader_forward_failed", "detail": e}))),
+            };
+        }
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "no_leader"})));
+    }
+
+    // ── We are leader: propose via Raft log ───────────────────────────────────
+    let entry = CommitEntry {
+        key:              req.key.clone(),
+        expected_version: req.expected_version,
+        delta:            req.delta.clone(),
+        agent_id:         req.agent_id.clone(),
+        read_set:         req.read_set.as_deref().unwrap_or(&[])
+            .iter().map(|e| (e.key.clone(), e.version_at_read)).collect(),
+        init_content:  None,
+        init_goal_tag: None,
+    };
+
+    match raft.client_write(entry).await {
+        Ok(resp) => {
+            let data = resp.data;
+            if data.error.is_none() {
+                (StatusCode::OK, Json(json!({
+                    "new_version": data.new_version,
+                    "shard_id":   data.shard_id,
+                    "via":        "raft",
+                })))
+            } else {
+                let sc = match data.error_code.as_deref() {
+                    Some("VersionMismatch") | Some("CrossShardStale")
+                    | Some("TokenConflict") => StatusCode::CONFLICT,
+                    Some("ShardNotFound")   => StatusCode::NOT_FOUND,
+                    _                       => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (sc, Json(json!({
+                    "error":  data.error_code,
+                    "detail": data.error,
+                    "via":    "raft",
+                })))
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(json!({"error": "raft_write_failed", "detail": msg})))
+        }
+    }
+}
+
+pub async fn commit_v1(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<CommitRequest>,
+) -> impl IntoResponse {
+    commit_v2(State(state), Json(req)).await
+}
+
+// ── POST /rollback ────────────────────────────────────────────────────────────
+pub async fn rollback(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<RollbackRequest>,
+) -> impl IntoResponse {
+    match state.bus.rollback(req) {
+        Ok(r)  => (StatusCode::OK, Json(serde_json::to_value(r).unwrap())),
+        Err(e) => {
+            let sc = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (sc, Json(json!({"error": e.error_code(), "detail": e.to_string()})))
+        }
+    }
+}
+
+// ── GET /stats ────────────────────────────────────────────────────────────────
+pub async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut s = state.bus.stats();
+    if let Some(ref raft) = state.raft {
+        let m = raft.metrics().borrow().clone();
+        s["raft"] = json!({
+            "state":          format!("{:?}", m.state),
+            "current_leader": m.current_leader,
+            "current_term":   m.current_term,
+            "last_log_index": m.last_log_index,
+            "last_applied":   m.last_applied,
         });
     }
-    Ok(())
+    (StatusCode::OK, Json(s))
 }
 
-/// XOR-fold comparison — O(n) regardless of where the first mismatch occurs.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, state.bus.prometheus_metrics())
 }
 
-// ── Response helpers ──────────────────────────────────────────────────────────
+// ── Admin endpoints ───────────────────────────────────────────────────────────
 
-fn err_resp(e: SyncError) -> impl IntoResponse {
-    let status = StatusCode::from_u16(e.status_code())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(json!({"error": e.error_code(), "detail": e.to_string()}))).into_response()
+#[derive(Serialize, Deserialize)]
+pub struct AddNodeRequest {
+    pub node_id:     u64,
+    pub addr:        String,
+    pub new_members: Vec<u64>,  // complete new voter set including the new node
 }
 
-macro_rules! blocking {
-    ($bus:expr, $op:expr) => {
-        match tokio::task::spawn_blocking(move || $op).await {
-            Ok(Ok(r))  => (StatusCode::OK, Json(json!(r))).into_response(),
-            Ok(Err(e)) => err_resp(e).into_response(),
-            Err(_)     => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+/// Convenience endpoint: add a new node to the Raft cluster in one call.
+/// Combines add_learner (sends snapshot, waits for catch-up) then
+/// change_membership (promotes to voter).
+/// Requires SBUS_ADMIN_ENABLED=1 and must be called on the current leader.
+/// Python: POST /admin/add-node {"node_id":3,"addr":"http://localhost:7003","new_members":[0,1,2,3]}
+pub async fn admin_add_node(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<AddNodeRequest>,
+) -> impl IntoResponse {
+    if !state.admin_enabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin disabled"})));
+    }
+    let Some(ref raft) = state.raft else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "not in Raft mode"})));
     };
+    if !state.is_leader() {
+        if let Some(url) = state.leader_url() {
+            // Forward to leader
+            let full = format!("{url}/admin/add-node");
+            return match post_json(&state.cluster.client, &full, &req).await {
+                Ok((s, b)) => {
+                    let sc = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY);
+                    (sc, Json(b))
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY,
+                           Json(json!({"error": "leader_forward_failed", "detail": e}))),
+            };
+        }
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "no_leader"})));
+    }
+
+    // Step 1: add_learner — openRaft sends snapshot to new node and waits for catch-up
+    let node = openraft::BasicNode { addr: req.addr.clone() };
+    if let Err(e) = raft.add_learner(req.node_id, node, true).await {
+        let m = format!("{e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "add_learner failed", "detail": m})));
+    }
+
+    // Step 2: change_membership — promote to full voter
+    let members: std::collections::BTreeSet<u64> = req.new_members.iter().cloned().collect();
+    match raft.change_membership(members, false).await {
+        Ok(_)  => (StatusCode::OK, Json(json!({
+            "status":      "added",
+            "node_id":     req.node_id,
+            "addr":        req.addr,
+            "new_members": req.new_members,
+        }))),
+        Err(e) => {
+            let m = format!("{e}");
+            (StatusCode::INTERNAL_SERVER_ERROR,
+             Json(json!({"error": "change_membership failed", "detail": m})))
+        }
+    }
 }
 
-// ── Shard CRUD ────────────────────────────────────────────────────────────────
-
-pub async fn create_shard(
-    State(bus): State<SBus>,
-    Json(req):  Json<CreateShardRequest>,
+pub async fn admin_create_shard(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<CreateShardRequest>,
 ) -> impl IntoResponse {
-    blocking!(bus, bus.create_shard(req))
+    // Direct write to local state.bus — bypasses Raft entirely.
+    // Used ONLY for test setup in DR-7 (SBUS_ADMIN_ENABLED=1 required).
+    // The shard is seeded on each node so DR-7 can test election without
+    // depending on Raft replication to every node.
+    if !state.admin_enabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin disabled"})));
+    }
+    match state.bus.create_shard(req) {
+        Ok(r)  => (StatusCode::CREATED, Json(serde_json::to_value(r).unwrap())),
+        Err(e) => {
+            // ShardAlreadyExists is OK (idempotent seed)
+            if e.error_code() == "ShardAlreadyExists" {
+                return (StatusCode::OK, Json(json!({"status": "already_exists"})));
+            }
+            let sc = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (sc, Json(json!({"error": e.error_code(), "detail": e.to_string()})))
+        }
+    }
 }
 
-/// ?agent_id=X  → records delivery in DeliveryLog (WSS cross-shard tracking).
-/// (omitted)    → read only, no delivery recorded (backwards-compatible).
+pub async fn admin_commit(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<CommitRequest>,
+) -> impl IntoResponse {
+    // Direct commit to local state.bus — bypasses Raft entirely.
+    // Used ONLY for admin sync (SBUS_ADMIN_ENABLED=1 required).
+    // Allows syncing follower state after post-election when Raft
+    // AppendEntries are delayed in the in-memory prototype.
+    if !state.admin_enabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin disabled"})));
+    }
+    state.bus.touch_delivery_log(&req.agent_id);
+    match state.bus.commit_delta_v2(req) {
+        Ok(r)  => (StatusCode::OK, Json(serde_json::to_value(r).unwrap())),
+        Err(e) => {
+            let sc = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (sc, Json(json!({"error": e.error_code(), "detail": e.to_string()})))
+        }
+    }
+}
+
+pub async fn admin_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut h = state.bus.admin_health();
+    if let Some(ref raft) = state.raft {
+        let m = raft.metrics().borrow().clone();
+        h["raft_state"]  = json!(format!("{:?}", m.state));
+        h["raft_leader"] = json!(m.current_leader);
+        h["raft_term"]   = json!(m.current_term);
+    }
+    (StatusCode::OK, Json(h))
+}
+
+pub async fn admin_reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.admin_enabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin disabled"})));
+    }
+    let n = state.bus.reset_all();
+    (StatusCode::OK, Json(json!({"cleared": n})))
+}
+
+pub async fn admin_delivery_log(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.admin_enabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin disabled"})));
+    }
+    (StatusCode::OK, Json(state.bus.dump_delivery_log()))
+}
+
 #[derive(Deserialize)]
-pub struct ReadShardParams {
-    #[serde(default)]
-    pub agent_id: String,
+pub struct InjectStaleRequest {
+    pub agent_id: String, pub key: String, pub stale_version: u64,
 }
-
-pub async fn read_shard(
-    State(bus):    State<SBus>,
-    Path(key):     Path<String>,
-    Query(params): Query<ReadShardParams>,
+pub async fn admin_inject_stale(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<InjectStaleRequest>,
 ) -> impl IntoResponse {
-    let agent_id = params.agent_id.clone();
-    blocking!(bus, bus.read_shard(&key, &agent_id))
+    if !state.admin_enabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin disabled"})));
+    }
+    state.bus.inject_stale_delivery(&req.agent_id, &req.key, req.stale_version);
+    (StatusCode::OK, Json(json!({"injected": true})))
 }
 
-pub async fn list_shards(State(bus): State<SBus>) -> impl IntoResponse {
-    let shards = bus.list_shards();
-    (StatusCode::OK, Json(json!({"shards": shards}))).into_response()
-}
-
-// ── ACP commit handlers ───────────────────────────────────────────────────────
-
-/// POST /commit — legacy path (no DeliveryLog cross-shard check).
-pub async fn commit(
-    State(bus): State<SBus>,
-    headers:    HeaderMap,
-    Json(req):  Json<CommitRequest>,
+#[derive(Deserialize)]
+pub struct SessionRequest { pub agent_id: String }
+pub async fn create_session(
+    State(state): State<Arc<AppState>>,
+    Json(req):    Json<SessionRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_agent_hmac(&headers, &req.agent_id) {
-        return err_resp(e).into_response();
-    }
-    blocking!(bus, bus.commit_delta(req))
-}
-
-/// POST /commit/v2 — WSS path.
-/// DeliveryLog + optional explicit read_set (ARSI for FP = 0).
-pub async fn commit_v2(
-    State(bus): State<SBus>,
-    headers:    HeaderMap,
-    Json(req):  Json<CommitRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_agent_hmac(&headers, &req.agent_id) {
-        return err_resp(e).into_response();
-    }
-    blocking!(bus, bus.commit_delta_v2(req))
-}
-
-/// POST /commit/v2_naive — deadlock demo. Deadlocks at N ≥ 8.
-pub async fn commit_v2_naive(
-    State(bus): State<SBus>,
-    headers:    HeaderMap,
-    Json(req):  Json<CommitRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_agent_hmac(&headers, &req.agent_id) {
-        return err_resp(e).into_response();
-    }
-    blocking!(bus, bus.commit_delta_v2_naive(req))
-}
-
-// ── Rollback ──────────────────────────────────────────────────────────────────
-
-pub async fn rollback(
-    State(bus): State<SBus>,
-    headers:    HeaderMap,
-    Json(req):  Json<RollbackRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = verify_agent_hmac(&headers, &req.agent_id) {
-        return err_resp(e).into_response();
-    }
-    blocking!(bus, bus.rollback(req))
-}
-
-// ── Observability ─────────────────────────────────────────────────────────────
-
-pub async fn stats(State(bus): State<SBus>) -> impl IntoResponse {
-    (StatusCode::OK, Json(bus.stats())).into_response()
-}
-
-pub async fn metrics(State(bus): State<SBus>) -> impl IntoResponse {
-    (StatusCode::OK, bus.prometheus_metrics()).into_response()
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hmac_sha256_known_vector() {
-        // RFC 4231 Test Case 1
-        // key  = 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b (20 bytes)
-        // data = "Hi There"
-        // expected = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
-        let key  = [0x0bu8; 20];
-        let data = b"Hi There";
-        let result = hmac_sha256(&key, data);
-        let hex   = hex::encode(result);
-        assert_eq!(
-            hex,
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-    }
-
-    #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(!constant_time_eq(b"", b"a"));
-        assert!(constant_time_eq(b"", b""));
-    }
+    state.bus.touch_delivery_log(&req.agent_id);
+    (StatusCode::OK, Json(json!({"agent_id": req.agent_id, "status": "created"})))
 }

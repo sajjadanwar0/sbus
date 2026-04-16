@@ -109,7 +109,7 @@ impl Shard {
 // HTTP request / response types
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateShardRequest {
     pub key:      String,
     pub content:  String,
@@ -122,7 +122,7 @@ pub struct ReadSetEntry {
     pub version_at_read: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommitRequest {
     pub key: String,
     #[serde(alias = "expected_ver")]
@@ -136,7 +136,7 @@ pub struct CommitRequest {
     pub read_set: Option<Vec<ReadSetEntry>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RollbackRequest {
     #[serde(default)]
     pub check_token:    bool,
