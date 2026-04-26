@@ -366,11 +366,3 @@ statistical) with mitigations cross-referenced.
 
 MIT. See `LICENSE` files in each crate.
 
----
-
-## Contact
-
-Sajjad Khan — sajjadnawar200@gmail.com — [github.com/sajjadanwar0](https://github.com/sajjadanwar0)
-
-Issues: <https://github.com/sajjadanwar0/sbus/issues>
-# sbus
