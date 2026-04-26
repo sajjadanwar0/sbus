@@ -1,0 +1,43 @@
+[package]
+name         = "sbus-baselines"
+description  = "Rust-native CC baseline adapters (PostgreSQL, Redis) for the S-Bus paper"
+version      .workspace = true
+edition      .workspace = true
+rust-version .workspace = true
+authors      .workspace = true
+license      .workspace = true
+repository   .workspace = true
+
+[[bin]]
+name = "pg-adapter"
+path = "src/bin/pg_adapter.rs"
+
+[[bin]]
+name = "redis-adapter"
+path = "src/bin/redis_adapter.rs"
+
+[dependencies]
+tokio              .workspace = true
+axum               .workspace = true
+serde              .workspace = true
+serde_json         .workspace = true
+tracing            .workspace = true
+tracing-subscriber .workspace = true
+chrono             .workspace = true
+sha2               .workspace = true
+hex                .workspace = true
+
+tokio-postgres    = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+
+
+redis = { version = "0.27", features = ["tokio-comp", "aio", "connection-manager"] }
+
+[lints.rust]
+unused_imports = "warn"
+dead_code      = "warn"
+
+[lints.clippy]
+all                = "warn"
+too_many_arguments = "allow"
+needless_return    = "allow"

@@ -1,0 +1,39 @@
+# Cargo build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local data directories (sled, WAL)
+/data/
+**/data/
+*.wal
+*.wal.tmp
+*.sled
+*.sled.tmp
+
+# Logs
+*.log
+logs/
+
+# Local environment
+.env
+.env.local
+
+# Python tooling that might creep in
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Rust analyzer caches
+*.rs.bk
+.rustc_info.json

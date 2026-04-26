@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members  = ["sbus-server", "sbus-baselines", "sbus-proxy"]
+
+[workspace.package]
+version      = "1.0.0"
+edition      = "2024"
+rust-version = "1.85"
+authors      = ["Sajjad Khan <sajjadanwar0@gmail.com>"]
+license      = "MIT"
+repository   = "https://github.com/sajjadanwar0/sbus"
+
+# Shared dependency versions. Member crates pick from this pool via
+# `dependency.workspace = true` so all three binaries build against the
+# same major versions — matches paper §VI's "matched-language Rust"
+# discipline for §VII-N baseline comparison.
+[workspace.dependencies]
+tokio              = { version = "1",    features = ["full"] }
+axum               = { version = "0.8",  features = ["macros"] }
+tower-http         = { version = "0.6",  features = ["cors", "trace"] }
+serde              = { version = "1",    features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3",  features = ["env-filter"] }
+thiserror          = "2"
+chrono             = { version = "0.4",  features = ["serde"] }
+sha2               = "0.11"
+hex                = "0.4"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
