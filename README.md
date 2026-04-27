@@ -1,348 +1,273 @@
-# S-Bus
+# sbus
 
-**A Rust workspace implementing automatic read-set reconstruction for
-multi-agent LLM state coordination.**
+**Rust implementation of the S-Bus middleware.**
 
-This monorepo contains the Rust components of the S-Bus system. It is
-organised as a Cargo workspace with three member crates:
+This repository contains the Rust workspace measured in:
 
-- [`sbus-server/`](sbus-server/) — the S-Bus middleware itself: HTTP
-  server, ACP commit engine, DeliveryLog, openraft-replicated cluster.
-- [`sbus-baselines/`](sbus-baselines/) — Rust-native PostgreSQL
-  (`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`) and Redis
-  (`WATCH/MULTI/EXEC`) adapters. Used for the matched-mechanism CC
-  baselines in the paper's PG-Comparison and PG-Contention experiments.
-- [`sbus-proxy/`](sbus-proxy/) — transparent LLM-API proxy. Path-routes
-  requests to OpenAI / Anthropic / Google upstreams, scans
-  responses for shard references, and registers them with S-Bus's
-  DeliveryLog via a skip-if-exists protocol. Used in PROXY-PH2.
+> *S-Bus: Automatic Read-Set Reconstruction for Multi-Agent LLM State
+> Coordination.* Sajjad Khan, 2026. _arXiv ID forthcoming._
 
-Companion repositories:
+S-Bus is an HTTP middleware that applies optimistic concurrency control
+to multi-agent LLM state. The server-side **DeliveryLog** records
+every HTTP `GET` request per agent session, automatically reconstructing
+each agent's read-set at commit time and rejecting commits whose
+cross-shard reads have been superseded — without any agent SDK changes
+under HTTP/1.1.
+
+**Companion repositories:**
 
 - [`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments) —
-  Python experiment harness (PH-2, PH-3, ORI-Isolation, PG-Comparison,
-  PROXY-PH2, Workload-B, DR-9, and others)
+  Python experimental harness producing every empirical measurement in
+  the paper.
 - [`sbus-formals`](https://github.com/sajjadanwar0/sbus-formals) —
-  TLA+, TLAPS, and Dafny mechanised verification (687 TLAPS obligations,
-  19 Dafny lemmas, 211M TLC states)
+  TLA+, TLAPS, and Dafny mechanised proofs.
 
 ---
 
-## The paper
+## Workspace structure
 
-**S-Bus: Automatic Read-Set Reconstruction for Multi-Agent LLM State
-Coordination.** Sajjad Khan, 2026. [arXiv link — TBA]
+The repository is a Cargo workspace with three crates:
 
-Concurrent LLM agents sharing mutable natural-language state produce
-**Structural Race Conditions**: write–write and cross-shard stale-read
-conflicts that silently corrupt agent output. Existing multi-agent
-frameworks (LangGraph, CrewAI, AutoGen) provide no write-ownership
-semantics over shared state.
-
-S-Bus's central technical mechanism is the **DeliveryLog**: a server-side
-per-agent log of HTTP `GET` operations that automatically reconstructs
-each agent's read-set at commit time without agent SDK changes (under
-HTTP/1.1). The DeliveryLog turns ordinary HTTP traffic into a verifiable
-read-set, enabling optimistic concurrency control over multi-agent
-shared state.
-
-The consistency property the DeliveryLog provides is **Observable-Read
-Isolation (ORI)**: a partial causal consistency over the HTTP-observable
-projection of an agent's read set.
-
-S-Bus targets the **dedicated-shard topology** (each agent owns a
-distinct write key, reads from shared reference shards) — see Box 2 in
-the paper for deployment guidance. Single-shard collaborative writing
-is out of scope.
-
----
-
-## Headline empirical results
-
-| Finding | Value | Source |
+| Crate | Role | Default port |
 |---|---|---|
-| Type-I corruptions under active contention | **0 / 427,308** | PG-Contention, three backends |
-| Type-I corruptions, full sweep | 0 / 884,110 | PG-Comparison combined |
-| Workload-B view-divergence (ORI-OFF) | 590 / 639 commits | server-side counters |
-| Workload-B view-divergence (ORI-ON) | **0 / 638 commits** | server-side counters |
-| TLAPS obligations proved | 687 / 687 (1 axiom) | `sbus-formals` |
-| TLC distinct states (single node, N=4) | 211,696,712 | `sbus-formals` |
-| Dafny inductive lemmas verified | 19 / 19 | `sbus-formals` |
-
----
-
-## Repository layout
+| `sbus-server` | The S-Bus middleware itself: ACP, DeliveryLog, registry, optional Raft | 7000 |
+| `sbus-baselines` | PostgreSQL and Redis HTTP adapters exposing the same `/shard` + `/commit` API for safety-parity comparisons | 7001 (PG), 7002 (Redis) |
+| `sbus-proxy` | Transparent LLM-API proxy that intercepts completions and populates the DeliveryLog with shard references appearing in agent context (used in Exp. PROXY-PH2) | 9000 |
 
 ```
-.
-├── Cargo.toml                  # workspace root
-├── README.md                   # this file
+sbus/
+├── Cargo.toml                   workspace manifest
+├── Cargo.lock
+├── README.md                    this file
+├── LICENSE                      MIT
 │
-├── sbus-server/                # the measured system
-│   ├── Cargo.toml
-│   ├── README.md
-│   └── src/
-│       ├── main.rs             # entry point, HTTP router, Raft bootstrap
-│       ├── api/                # HTTP handlers
-│       │   ├── handlers.rs       (~636 lines: GET/shard, POST/commit, /admin/*)
-│       │   ├── cluster_handlers.rs
-│       │   └── raft_handlers.rs
-│       ├── bus/                # core ACP
-│       │   ├── engine.rs         (~572 lines: SBus, commit_delta, WAL)
-│       │   ├── registry.rs       (ShardRegistry + DeliveryLog)
-│       │   └── types.rs
-│       ├── cluster/mod.rs
-│       ├── raft/                 # openraft 0.8.4 + sled persistence
-│       └── metrics/collector.rs  # Prometheus-style metrics
+├── sbus-server/                 the measured system (~2,953 LOC)
+│   ├── src/
+│   │   ├── main.rs              Axum server entry
+│   │   ├── api/                 HTTP route handlers (cluster + Raft + main)
+│   │   ├── bus/                 ACP, DeliveryLog, registry, WAL
+│   │   ├── cluster/             cluster coordination
+│   │   ├── raft/                openraft integration (P1 session replication)
+│   │   └── metrics/             Prometheus exposition + ORI counters
+│   ├── benches/                 Criterion micro-benchmarks
+│   └── Cargo.toml
 │
-├── sbus-baselines/             # PG-SER and REDIS-WATCH adapters
-│   ├── Cargo.toml
-│   └── src/bin/
-│       ├── pg_adapter.rs         (~651 lines: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE)
-│       └── redis_adapter.rs      (~596 lines: WATCH/MULTI/EXEC)
+├── sbus-baselines/              PG and Redis HTTP adapters (~1,247 LOC)
+│   ├── src/
+│   │   └── bin/
+│   │       ├── pg_adapter.rs    PostgreSQL SERIALIZABLE adapter
+│   │       └── redis_adapter.rs Redis WATCH/MULTI adapter
+│   └── Cargo.toml
 │
-└── sbus-proxy/                 # transparent LLM-API proxy
-    ├── Cargo.toml
+└── sbus-proxy/                  transparent LLM-API proxy (~2,194 LOC)
     ├── src/
-    │   ├── main.rs
+    │   ├── main.rs              hyper-based proxy server entry
     │   ├── lib.rs
-    │   ├── config.rs             # 12-factor env-driven config (3 upstreams)
-    │   ├── proxy.rs              (~453 lines: request routing, SSE streaming)
-    │   ├── extractor.rs          (~1030 lines: keyword-scan reference detection)
-    │   ├── vocabulary.rs         # domain vocabulary
-    │   └── delivery_log.rs       # client for POST /delivery_log/register
-    └── tests/integration.rs      # against mock servers
+    │   ├── proxy.rs             multi-vendor request routing
+    │   ├── extractor.rs         response-content shard-keyword extraction
+    │   ├── delivery_log.rs      upstream DeliveryLog forwarding
+    │   ├── vocabulary.rs        shard-vocabulary loading + matching
+    │   └── config.rs
+    ├── tests/integration.rs     end-to-end proxy tests
+    └── Cargo.toml
 ```
-
-Total Rust: ~6,300 lines across three crates, zero `unsafe`.
 
 ---
 
-## Building
+## Quickstart
 
-The workspace builds all three crates with one command:
+Requires Rust 1.75+ (2024 edition).
 
 ```bash
+git clone https://github.com/sajjadanwar0/sbus
+cd sbus
+
+# Build the whole workspace
 cargo build --release
+
+# Run the server (Terminal 1)
+SBUS_ADMIN_ENABLED=1 cargo run --release -p sbus-server
+# → http://localhost:7000
+
+# Sanity check (Terminal 2)
+curl -X POST http://localhost:7000/shard \
+    -H 'Content-Type: application/json' \
+    -d '{"key":"models_state","content":"v1"}'
+
+curl http://localhost:7000/shard/models_state
+
+curl -X POST http://localhost:7000/commit \
+    -H 'Content-Type: application/json' \
+    -d '{"key":"models_state","expected_version":1,"delta":"v2","agent_id":"a1"}'
 ```
 
-Or build individual crates:
-
-```bash
-cargo build --release -p sbus-server
-cargo build --release -p sbus-baselines    # produces pg-adapter, redis-adapter
-cargo build --release -p sbus-proxy
-```
-
-Requires Rust edition 2024 (stable 1.85+).
+A 200 response on the third call means the ACP is working. For the
+end-to-end validation harness, see
+[`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments).
 
 ---
 
-## Running
+## sbus-server
 
-### Single-node S-Bus (most experiments)
+The HTTP middleware measured in the paper. ~950 lines of safe Rust for
+the single-node ACP core; ~1,679 lines including Raft coordination and
+sled persistence. Zero `unsafe` blocks.
+
+### Key endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/shard` | Create a new shard with initial content |
+| `GET` | `/shard/:key` | Read current shard content; logged in DeliveryLog |
+| `GET` | `/shards` | List all shard keys |
+| `POST` | `/commit` | Atomic Commit Protocol — single-shard |
+| `POST` | `/commit/v2` | ACP with explicit cross-shard `read_set` (ARSI mode) |
+| `POST` | `/rollback` | Roll back a shard to a prior version |
+| `GET` | `/stats` | Server statistics + ORI counters (`view_checked_commits`, `view_divergent_commits`) |
+| `GET` | `/metrics` | Prometheus exposition |
+| `POST` | `/admin/config` | Runtime ORI on/off toggle (gated by `SBUS_ADMIN_ENABLED=1`) |
+| `POST` | `/admin/reset` | Wipe registry (used by experiment harness) |
+
+### Configuration
 
 ```bash
-SBUS_ADMIN_ENABLED=1 ./target/release/sbus-server
-# → http://localhost:7000
+SBUS_ADMIN_ENABLED=1            # enable /admin/* endpoints (default: off)
+SBUS_LISTEN=0.0.0.0:7000        # bind address (default: 127.0.0.1:7000)
+SBUS_WAL_PATH=/var/sbus/wal     # write-ahead log path (default: ./sbus.wal)
+SBUS_RETRY_BUDGET=5             # ACP retry budget per agent step
+SBUS_LEASE_TTL_SECS=30          # ownership-token timeout
 ```
 
-Admin endpoints (e.g. `/admin/reset`, `/admin/config`,
-`/admin/delivery-log`) require `SBUS_ADMIN_ENABLED=1`.
+### Distributed deployment (3-node Raft)
 
-### LLM-API proxy (PROXY-PH2 experiments)
+The `--features raft` flag enables openraft 0.8.4 with sled-backed
+persistent storage. P1 session replication (Limitation 11 in the paper)
+is on by default when Raft is enabled.
 
 ```bash
-SBUS_PROXY_VOCAB="models_state,query_compiler,test_fixture,review_notes" \
-OPENAI_API_KEY=sk-... \
-ANTHROPIC_API_KEY=sk-ant-... \
-GOOGLE_API_KEY=... \
-  ./target/release/sbus-proxy
-# → http://localhost:9000
+cargo run --release -p sbus-server --features raft -- \
+    --node-id 0 --peers 127.0.0.1:7100,127.0.0.1:7101,127.0.0.1:7102
 ```
 
-The proxy path-routes to:
+Election timeout is randomised in `[500, 1000]` ms; heartbeat interval
+is 250 ms. See the paper's §IX for the full distributed-deployment
+discussion and Exp. DR-9 for empirical validation.
 
-- `/v1/chat/completions` → OpenAI (`api.openai.com`)
-- `/v1/messages` → Anthropic (`api.anthropic.com`)
-- `/v1beta/models/.../generateContent` → Google (`generativelanguage.googleapis.com`)
-
-Override upstreams with `SBUS_PROXY_UPSTREAM_URL`,
-`SBUS_PROXY_UPSTREAM_URL_ANTHROPIC`, `SBUS_PROXY_UPSTREAM_URL_GOOGLE`.
-
-### CC baselines (PG-Comparison, PG-Contention)
+### Benchmarks
 
 ```bash
-# Postgres SERIALIZABLE adapter
-PG_DSN="host=localhost dbname=sbus user=sbus_user password=..." \
-  ./target/release/pg-adapter
+cargo bench -p sbus-server
+```
+
+Criterion micro-benchmarks for the ACP commit path. The paper reports
+ACP overhead of approximately 5 µs per commit at N=4 (≈ 0.06% of a
+typical LLM inference call); your numbers will vary by hardware.
+
+---
+
+## sbus-baselines
+
+PostgreSQL and Redis HTTP adapters that expose the same `/shard` and
+`/commit` API as `sbus-server`, used in the paper's Exp. PG-Comparison
+and Exp. PG-Contention sweeps. Both adapters achieve safety parity with
+S-Bus on the contention workload (zero Type-I corruptions across
+427,308 active conflicts; see paper Table XIV).
+
+### PostgreSQL adapter
+
+Requires PostgreSQL 14+ with the `sbus_baseline` database created.
+Each agent session maps to a database connection with
+`default_transaction_isolation = serializable` pinned at connection
+time.
+
+```bash
+PG_DSN="host=localhost dbname=sbus_baseline user=sbus_user password=..." \
+    cargo run --release -p sbus-baselines --bin pg-adapter
 # → http://localhost:7001
+```
 
-# Redis WATCH/MULTI adapter
+### Redis adapter
+
+Requires Redis 7+. Cross-shard read-set validation is implemented by
+`WATCH`ing every key in the read-set before the `MULTI ... EXEC` block;
+if any version differs inside the transaction, `EXEC` returns null and
+the adapter retries.
+
+```bash
 REDIS_URL=redis://127.0.0.1:6379 \
-  ./target/release/redis-adapter
+    cargo run --release -p sbus-baselines --bin redis-adapter
 # → http://localhost:7002
 ```
 
-Both adapters expose the same JSON API as `sbus-server`, so the
-experiment harness in `sbus-experiments` can target any of the three
-backends interchangeably.
+---
 
-### 3-node Raft cluster
+## sbus-proxy
+
+Transparent LLM-API proxy used in the paper's Exp. PROXY-PH2 to
+decompose Rhidden coverage into HTTP-this-step, DL-accumulation, and
+proxy-marginal components. The proxy intercepts `/v1/chat/completions`
+(OpenAI), `/v1/messages` (Anthropic), and `/v1beta/models/...`
+(Google), scans response content for shard-vocabulary keywords, and
+populates the upstream `sbus-server`'s DeliveryLog with detected
+references at the agent's read-time version (skip-if-exists semantics).
 
 ```bash
-cd sbus-server
-./start_raft_cluster.sh    # starts nodes on 7001 / 7002 / 7003
-./stop_raft_cluster.sh     # tear down
+SBUS_PROXY_VOCAB="models_state,query_compiler,test_fixture,review_notes" \
+SBUS_PROXY_UPSTREAM=http://localhost:7000 \
+    cargo run --release -p sbus-proxy
+# → http://localhost:9000
 ```
+
+Then point your agent's API client at `http://localhost:9000` instead
+of the vendor's API endpoint. The proxy is stateless apart from the
+DeliveryLog forwarding; vendor responses are passed through unmodified.
+
+The paper reports the proxy's contribution as
+**+0.0018 paired marginal at V=4** (Table XV), with monotonically
+negative throughput contribution at larger vocabulary sizes.
+Keyword-scan is safety-preserving but coverage-marginal at the proxy
+layer; semantic-extraction-at-proxy is open work (Limitation 16).
 
 ---
 
-## Workload-B configuration
+## Reproducibility
 
-The `sbus-server` binary supports runtime ORI toggling via
-`POST /admin/config`. This is what powers the paper's Workload-B
-experiment (cross-shard view-divergence under ORI-ON vs. ORI-OFF):
+The server's structural counters (`view_checked_commits`,
+`view_divergent_commits`, `commit_attempts`, `commit_conflicts`) are
+deterministic given the ACP retry logic and version checks. They do
+not depend on LLM stochasticity. The paper's safety claims rest on
+these counters.
 
-```bash
-# Disable ORI (ori_off baseline)
-curl -X POST http://localhost:7000/admin/config \
-  -H 'content-type: application/json' \
-  -d '{"ori_enabled": false}'
-
-# Read current state and view-divergence counters
-curl http://localhost:7000/admin/config
-# → {"ori_enabled": false,
-#    "view_checked_commits": 638,
-#    "view_divergent_commits": 590}
-
-# Re-enable ORI
-curl -X POST http://localhost:7000/admin/config \
-  -H 'content-type: application/json' \
-  -d '{"ori_enabled": true}'
-```
-
-Under ORI-OFF, the cross-shard view-divergence counter still increments
-on stale sibling reads, but the commit succeeds (the failure mode ORI is
-designed to prevent). Under ORI-ON, divergent commits are rejected with
-HTTP 409 `CROSSSHARDSTALE`.
-
-This is the mechanism behind the paper's Table X: Workload-B records
-**0 / 638 divergent commits under ORI-ON** vs. **590 / 639 under
-ORI-OFF** (χ² = 1094.98, p < 10⁻²⁴⁰) across 8 architectural domains.
+The end-to-end experiments live in
+[`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments)
+and require this repository's binaries running. See that repo's
+`README.md` for the full reproduction recipe.
 
 ---
 
-## Reproducing paper results
+## What this repo establishes (and does not)
 
-The Python harness lives in
-[`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments).
-Each script is standalone and supports `--help`.
+**Establishes (by the artifacts here):**
 
-Quickest sanity check (≈2 min, no API keys needed):
+- A working Rust implementation of the S-Bus ACP, DeliveryLog, and
+  cross-shard validation logic.
+- HTTP adapters for PostgreSQL SERIALIZABLE and Redis WATCH/MULTI
+  exposing the same API for safety-parity comparisons.
+- A transparent LLM-API proxy for Rhidden coverage measurement.
+- Compile-time absence of `unsafe` blocks across the workspace.
 
-```bash
-# Terminal 1 — start S-Bus
-cargo run --release -p sbus-server
+**Does not establish:**
 
-# Terminal 2 — verify cross-shard staleness rejection
-cd ../sbus-experiments
-python3 cross_shard_validation.py --n-trials 50
-```
-
-Standard reproduction (≈15 min, ≈$2 API spend):
-
-```bash
-# SCR dose-response (Table XVIII, exact analytic match)
-python3 exp_sjv5_parallel.py --tasks-limit 1
-```
-
-Full reproductions (PG-Comparison, PROXY-PH2 cross-backbone, etc.) are
-documented in the experiments-repo README.
-
----
-
-## Configuration reference
-
-### `sbus-server`
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `SBUS_PORT` | `7000` | HTTP listen port |
-| `SBUS_ADMIN_ENABLED` | unset | Set to `1` to enable `/admin/*` |
-| `SBUS_RAFT_NODE_ID` | unset (single-node) | Raft node ID for cluster mode |
-| `SBUS_RAFT_PEERS` | unset | `id1=url1,id2=url2,...` peer list |
-| `SBUS_DATA_DIR` | `./data/node{ID}` | sled storage directory |
-| `SBUS_WAL_PATH` | unset | Optional plaintext WAL path |
-| `SBUS_SESSION_TTL` | `3600` | DeliveryLog session TTL (seconds) |
-| `SBUS_LOG` | unset | Set to `1` to disable DeliveryLog (ablation) |
-| `RUST_LOG` | `info,sbus=debug` | tracing log level |
-
-### `sbus-proxy`
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `SBUS_PROXY_PORT` | `9000` | HTTP listen port |
-| `SBUS_URL` | `http://localhost:7000` | Where to register DeliveryLog entries |
-| `SBUS_PROXY_VOCAB` | required | Comma-separated shard names |
-| `SBUS_PROXY_UPSTREAM_URL` | `https://api.openai.com` | OpenAI-format upstream |
-| `SBUS_PROXY_UPSTREAM_URL_ANTHROPIC` | `https://api.anthropic.com` | Anthropic |
-| `SBUS_PROXY_UPSTREAM_URL_GOOGLE` | `https://generativelanguage.googleapis.com` | Google Gemini |
-| `SBUS_PROXY_AGENT_HEADER` | `X-SBus-Agent-Id` | Header carrying agent_id |
-| `SBUS_PROXY_DEBUG_PASSTHROUGH` | `false` | Bypass extraction (for benchmarking overhead) |
-
-### `sbus-baselines/pg-adapter`
-
-| Variable | Required | Purpose |
-|---|---|---|
-| `PG_DSN` | yes | Postgres connection string |
-| `PG_ADAPTER_PORT` | no (default `7001`) | HTTP listen port |
-
-### `sbus-baselines/redis-adapter`
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection |
-| `REDIS_ADAPTER_PORT` | `7002` | HTTP listen port |
-
----
-
-## Scope and honest limitations
-
-From the paper §VIII:
-
-1. **Topology restriction.** ORI is semantically neutral in
-   dedicated-shard topology, harmful in single-shard topology
-   (Exp. SHARED-STATE). Box 2 provides deployment guidance; there is
-   no automatic topology detection.
-2. **HTTP/2 breakage.** DeliveryLog completeness relies on
-   FIFO-per-TCP-connection ordering. HTTP/2 multiplexing can violate
-   this. Mitigation: pin to HTTP/1.1 via reverse proxy, or use ARSI
-   mode.
-3. **`R_hidden` coverage.** Structural guarantees apply to the
-   HTTP-observable projection of the read set (~26.1% of single-step
-   references on the principal workload). Session-scoped DeliveryLog
-   accumulation extends observable coverage of self-reported
-   references to ~99.8% over a full session, but the denominator is
-   itself contaminated by self-report over-claim of 29–37% (paper
-   §VII-I); deflated upper bound on genuine-causal-read coverage is
-   ≤ 70%.
-4. **Concurrent-failover window.** Exp. DR-9 validates P1 session
-   replication under sequential GET-then-kill (30/30 ORI invariants
-   held). Leader failure within the ~5ms fire-and-forget replication
-   window leaves an unreplicated DeliveryLog entry — equivalent to
-   pre-P1 behaviour for that one agent session.
-5. **No refinement proof.** Dafny verifies the abstract algorithm;
-   the structural correspondence to the Rust implementation is by
-   eye. Full Rust refinement via Verus or Creusot is future work.
-6. **One retained TLAPS axiom.** `FunTypingReconstruction`, a
-   primitive fact about TLA+ function-space typing not present in
-   the standard library. See `sbus-formals/historical/` for ongoing
-   work to discharge it.
-
-The paper's §VIII discusses each of these in detail, and §VIII-A
-treats them as threats to validity (internal, external, construct,
-statistical) with mitigations cross-referenced.
+- **Formal correspondence between this code and the paper's TLA+/Dafny
+  specifications.** Refinement to the implementation is empirical
+  (884K-attempt zero-corruption evidence in the paper), not mechanised.
+  Standard practice short of IronFleet. See
+  [`sbus-formals`](https://github.com/sajjadanwar0/sbus-formals) for
+  the abstract-algorithm proofs.
+- **Production hardening.** This is a research artifact. There is no
+  HMAC request signing (Limitation 5 in the paper, future work),
+  no TLS termination (use a reverse proxy), no multi-tenant isolation,
+  and no rate limiting beyond what `axum` provides by default.
 
 ---
 
@@ -355,14 +280,15 @@ statistical) with mitigations cross-referenced.
                  LLM State Coordination},
   institution = {Independent},
   year        = {2026},
-  note        = {arXiv preprint},
-  url         = {https://arxiv.org/abs/...}
+  note        = {arXiv preprint}
 }
 ```
+
+_Once the arXiv ID is assigned, add `url = {https://arxiv.org/abs/XXXX.XXXXX}`
+and the eprint ID to the BibTeX above._
 
 ---
 
 ## License
 
-MIT. See `LICENSE` files in each crate.
-
+MIT. See `LICENSE` at the repo root.
