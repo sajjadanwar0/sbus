@@ -1,7 +1,4 @@
 #!/bin/bash
-# restart_node.sh — Restart a single node after DR-6 kills it
-# Usage: ./restart_node.sh <node_id>  (0, 1, or 2)
-# Example: ./restart_node.sh 2
 
 NODE_ID="${1:-2}"
 SBUS_ROOT="${2:-$HOME/RustroverProjects/sbus}"

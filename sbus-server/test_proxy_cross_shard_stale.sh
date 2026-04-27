@@ -1,51 +1,8 @@
 #!/usr/bin/env bash
-# ────────────────────────────────────────────────────────────────────────────
-# tests/test_proxy_cross_shard_stale.sh
-#
-# Reproducible end-to-end test for the proxy paper's central safety claim:
-#
-#   CLAIM: A DeliveryLog entry recorded by the sbus-proxy (not by HTTP GET)
-#   participates in the same ORI cross-shard validation as HTTP-recorded
-#   entries. Specifically:
-#
-#     (A) Positive case: if the proxy records agent X reading shard K at
-#         version V, and K is subsequently advanced to V+1 by agent Y,
-#         then agent X's next commit (to any shard in the same session)
-#         is rejected with CrossShardStale.
-#
-#     (B) Negative control: in the same scenario but with NO proxy-recorded
-#         entry for agent X, X's commit succeeds. This rules out the
-#         possibility that something else in the pipeline is causing the
-#         rejection in case (A).
-#
-# Both cases use ONLY direct HTTP calls to S-Bus — no OpenAI dependency,
-# no real LLM, no agent framework. The proxy's extraction + registration
-# step is simulated by calling /delivery_log/register directly, which is
-# exactly what the proxy does in production (verified in agent_openai.py
-# integration tests).
-#
-# Prerequisites:
-#   - S-Bus server (v45 or later) running on localhost:7000
-#   - Server launched with SBUS_ADMIN_ENABLED=1 so /admin/reset works
-#     cleanly between runs (NOTE: /admin/reset itself is ungated, but
-#     /admin/delivery-log diagnostic is gated — this test uses reset only)
-#   - jq installed (for pretty-printing + pass/fail assertions)
-#
-# Usage:
-#   chmod +x tests/test_proxy_cross_shard_stale.sh
-#   tests/test_proxy_cross_shard_stale.sh
-#
-# Exit status:
-#   0 = both cases behaved as expected (test passes)
-#   1 = at least one case behaved unexpectedly (test fails)
-#   2 = prerequisite missing or network failure
-# ────────────────────────────────────────────────────────────────────────────
-
-set -u   # fail on undefined variables; explicit error handling everywhere else
+set -u
 
 SBUS_URL="${SBUS_URL:-http://localhost:7000}"
 
-# ─── helpers ─────────────────────────────────────────────────────────────
 bold()  { printf "\n\033[1m%s\033[0m\n" "$*"; }
 ok()    { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 fail()  { printf "  \033[31m✗\033[0m %s\n" "$*"; }
@@ -60,8 +17,6 @@ require() {
 }
 
 reset_state() {
-  # POST /admin/reset is ungated in handlers.rs (safe operation — wipes
-  # registry + DeliveryLog, does not expose data).
   local r
   r=$(curl -sS -X POST "$SBUS_URL/admin/reset") || { fail "reset failed"; exit 2; }
   info "reset: $r"
@@ -76,8 +31,6 @@ create_shard() {
 }
 
 commit() {
-  # args: key, expected_version, agent_id, read_set_json
-  # echoes the HTTP response body; caller inspects with jq.
   local key="$1"; local ev="$2"; local agent="$3"; local rs="$4"
   curl -sS -X POST "$SBUS_URL/commit/v2" \
        -H 'content-type: application/json' \
@@ -91,7 +44,6 @@ commit() {
 }
 
 proxy_register() {
-  # args: agent_id, shard_name
   local agent="$1"; local shard="$2"
   curl -sS -X POST "$SBUS_URL/delivery_log/register" \
        -H 'content-type: application/json' \
@@ -104,7 +56,6 @@ proxy_register() {
            }"
 }
 
-# ─── preflight ───────────────────────────────────────────────────────────
 require curl
 require jq
 
@@ -118,9 +69,6 @@ ok "S-Bus is reachable at $SBUS_URL"
 PASSED=0
 FAILED=0
 
-# ────────────────────────────────────────────────────────────────────────
-# CASE A — positive: proxy-recorded entry → stale → commit rejected
-# ────────────────────────────────────────────────────────────────────────
 bold "case A (positive): proxy-recorded read → staleness → CrossShardStale"
 
 info "step 1: reset"
@@ -165,9 +113,6 @@ else
   FAILED=$((FAILED+1))
 fi
 
-# ────────────────────────────────────────────────────────────────────────
-# CASE B — negative control: no proxy entry → commit accepted
-# ────────────────────────────────────────────────────────────────────────
 bold "case B (negative control): no proxy-recorded read → commit succeeds"
 
 info "step 1: reset"
@@ -203,19 +148,16 @@ else
   FAILED=$((FAILED+1))
 fi
 
-# ────────────────────────────────────────────────────────────────────────
-# summary
-# ────────────────────────────────────────────────────────────────────────
 hr
 bold "summary"
 info "passed: $PASSED   failed: $FAILED"
 
 if [[ $FAILED -eq 0 ]]; then
-  bold "✓ ALL CASES PASSED"
+  bold " ALL CASES PASSED"
   bold "  The proxy-recorded DeliveryLog entry participates in ORI"
   bold "  cross-shard validation identically to HTTP-recorded entries."
   exit 0
 else
-  bold "✗ $FAILED CASE(S) FAILED"
+  bold " $FAILED CASE(S) FAILED"
   exit 1
 fi

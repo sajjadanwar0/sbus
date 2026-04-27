@@ -63,7 +63,6 @@ async fn main() {
     bus.rebuild_from_wal();
     bus.spawn_lease_monitor();
 
-    // ── sled init ────────────────────────────────────────────────────────────
     let data_dir = std::env::var("SBUS_DATA_DIR")
         .unwrap_or_else(|_| format!("./data/node{}", raft_node_id.unwrap_or(0)));
     std::fs::create_dir_all(&data_dir)
@@ -71,10 +70,8 @@ async fn main() {
     let (logs_tree, meta_tree) = open_db(&data_dir);
     tracing::info!("sled database opened at {data_dir}");
 
-    // ── Raft init ────────────────────────────────────────────────────────────
     let sbus_raft = if let Some(node_id) = raft_node_id {
         let config = build_raft_config();
-        // SBusStore restores state from sled snapshot on startup.
         let store = SBusStore::new(bus.clone(), logs_tree.clone(), meta_tree.clone());
         let (log_store, state_machine) = Adaptor::<SBusTypeConfig, SBusStore>::new(store);
 

@@ -1,17 +1,10 @@
 #!/bin/bash
-# ============================================================
-# start_raft_cluster.sh — S-Bus v37 (Raft + sled persistence)
-# Usage: ./start_raft_cluster.sh [sbus_root_path]
-# Example: ./start_raft_cluster.sh
-# ============================================================
-
 set -e
 
 SBUS_ROOT="${1:-$HOME/RustroverProjects/sbus}"
 BINARY="$SBUS_ROOT/target/release/sbus-server"
 PEERS="0=http://localhost:7000,1=http://localhost:7001,2=http://localhost:7002"
 
-# ── Colors ───────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -20,10 +13,9 @@ success() { echo -e "${GREEN}[OK]${NC}  $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERR]${NC}  $1"; exit 1; }
 
-echo -e "${BOLD}S-Bus v37 — Raft + sled Cluster Bootstrap${NC}"
+echo -e "${BOLD}S-Bus — Raft + sled Cluster Bootstrap${NC}"
 echo "==========================================="
 
-# ── Step 1: Binary ───────────────────────────────────────────
 info "Step 1: Checking binary..."
 if [ ! -f "$BINARY" ]; then
     warn "Binary not found at $BINARY"
@@ -34,7 +26,6 @@ if [ ! -f "$BINARY" ]; then
 fi
 success "Binary: $BINARY"
 
-# ── Step 2: Kill existing processes ──────────────────────────
 info "Step 2: Clearing ports 7000-7002..."
 for port in 7000 7001 7002; do
     pids=$(lsof -ti :$port 2>/dev/null || true)
@@ -47,17 +38,14 @@ pkill -f "sbus-server" 2>/dev/null || true
 sleep 1
 success "Ports cleared"
 
-# ── Step 3: Create directories ───────────────────────────────
 info "Step 3: Creating directories..."
 mkdir -p "$SBUS_ROOT/logs"
 mkdir -p "$SBUS_ROOT/results"
-# sled data directories — one per node (persists across restarts)
 mkdir -p "$SBUS_ROOT/data/node0"
 mkdir -p "$SBUS_ROOT/data/node1"
 mkdir -p "$SBUS_ROOT/data/node2"
 success "Directories ready"
 
-# ── Step 4: Start 3 nodes ─────────────────────────────────────
 info "Step 4: Starting nodes..."
 
 SBUS_PORT=7000 SBUS_RAFT_NODE_ID=0 \
@@ -87,7 +75,6 @@ NODE2_PID=$!
 echo $NODE2_PID > /tmp/sbus_node2.pid
 success "Node 2 started (PID $NODE2_PID, port 7002, data: data/node2)"
 
-# ── Step 5: Wait for all 3 nodes to be ready ─────────────────
 info "Step 5: Waiting for nodes to be ready..."
 for port in 7000 7001 7002; do
     for i in $(seq 1 20); do
@@ -100,7 +87,6 @@ for port in 7000 7001 7002; do
     done
 done
 
-# ── Step 6: Bootstrap Raft cluster ───────────────────────────
 info "Step 6: Bootstrapping Raft..."
 sleep 1
 
@@ -133,7 +119,6 @@ curl -sf -X POST http://localhost:7000/raft/change-membership \
 success "3-node voting cluster configured"
 sleep 2
 
-# ── Step 7: Verify cluster status ────────────────────────────
 info "Step 7: Verifying cluster health..."
 echo ""
 echo -e "${BOLD}Cluster Status:${NC}"
@@ -156,7 +141,6 @@ else
     warn "Leader not yet elected — wait 2s then: curl http://localhost:7000/raft/leader"
 fi
 
-# ── Usage ─────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}Data directories (sled — persist across restarts):${NC}"
 echo "  data/node0/   data/node1/   data/node2/"

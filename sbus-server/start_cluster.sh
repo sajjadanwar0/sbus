@@ -1,7 +1,4 @@
 #!/bin/bash
-# start_cluster.sh — Start a 2-node S-Bus cluster for Exp. DR
-# Usage: ./start_cluster.sh /path/to/sbus-server
-
 SBUS_BIN=${1:-./target/release/sbus-server}
 NODES="http://localhost:7000,http://localhost:7001"
 mkdir -p logs

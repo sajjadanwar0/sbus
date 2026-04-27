@@ -1,6 +1,4 @@
 #!/bin/bash
-# stop_sbus_cluster.sh
-# Kills all S-Bus instances started by start_sbus_cluster.sh
 
 PID_FILE="logs/sbus_pids.txt"
 

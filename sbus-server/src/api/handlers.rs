@@ -391,20 +391,6 @@ pub struct ConfigRequest {
     pub ori_enabled: bool,
 }
 
-/// `POST /admin/config` — toggle the cross-shard staleness check at runtime.
-///
-/// Body: `{"ori_enabled": bool}`.
-/// Default at startup is `ori_enabled=true`. Setting it to `false` disables
-/// the DeliveryLog cross-shard validation in `commit_delta`; per-shard
-/// version checks and ownership-token semantics remain active.
-///
-/// Used by Workload-B (data-pipeline planning) to provide an ORI-OFF
-/// baseline for comparing structural-conflict prevention against degraded
-/// per-shard-only OCC. The harness flips this flag once at the start of
-/// each trial, before populating shards. There is no admin gating on this
-/// endpoint by design — the experiment harness controls it. If you deploy
-/// S-Bus to production and want to lock the flag, gate this handler behind
-/// `state.admin_enabled` (matching `admin_delivery_log` below).
 pub async fn admin_set_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ConfigRequest>,
@@ -419,11 +405,7 @@ pub async fn admin_set_config(
     )
 }
 
-/// `GET /admin/config` — return the current ORI-enabled flag value plus
-/// the server-side Workload-B view-divergence counters. Used by the
-/// harness to verify the server is in the expected mode before starting
-/// a trial, and to read the divergence counters at trial-end. Cheap; no
-/// side effects.
+
 pub async fn admin_get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let (checked, divergent) = state.bus.view_divergence_counters();
     (
@@ -495,10 +477,6 @@ pub struct ProxyRegisterRequest {
     pub source: String,
 }
 
-/// v50.1 adds `skipped_existing` to distinguish "proxy saw a reference the
-/// agent already had in DL" (common, safe: skip-if-exists preserved the
-/// true read-time version) from "no such shard in registry" (rare:
-/// vocab/state mismatch). Both return 200 OK; counts are in the body.
 #[derive(Serialize)]
 pub struct ProxyRegisterResponse {
     pub ok: bool,
@@ -507,37 +485,6 @@ pub struct ProxyRegisterResponse {
     pub skipped_no_shard: Vec<String>,
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// delivery_log_register — v50.1 PATCHED for Exp. PROXY-PH2
-// ═══════════════════════════════════════════════════════════════════════
-// Pilot v50.0 showed 28/192 Type-I corruptions under proxy_on vs. 0 under
-// proxy_off. Root cause: the old handler recorded every proxy-extracted
-// shard reference at the CURRENT server-side version, overwriting the
-// agent's true read-time version established by the native HTTP GET path.
-// ORI's cross-shard check then trivially passed (current == current),
-// silently bypassing stale-read detection.
-//
-// Example pathology:
-//   1. Agent α0 GETs models_state at v=2 → DL[α0][models_state] = 2
-//   2. Agent α1 commits models_state to v=3
-//   3. Agent α0's LLM context still mentions models_state (from memory)
-//   4. Proxy scans, POSTs /delivery_log/register
-//   5. OLD handler: records at current v=3 → overwrites α0's v=2 entry
-//   6. α0 tries to commit shard Y listing models_state in read-set
-//   7. ORI cross-shard check: DL[α0][models_state]=3, current=3 → PASS
-//   8. Stale commit proceeds despite α0's reasoning being rooted in v=2.
-//
-// FIX: skip-if-exists.
-//   - If DL[agent_id][shard_key] already exists (and is within TTL), skip.
-//     Preserves the true read-time version set by the HTTP GET path.
-//   - If no entry exists, record at current version. This is still
-//     imperfect for agents referencing a never-fetched shard purely from
-//     memory of the task description, but it cannot corrupt the common
-//     case of re-mentioning a previously-fetched shard. The residual gap
-//     (proxy-only-captured references with unknown read-time versions)
-//     is the structural limit of keyword-scan proxy capture and is
-//     scoped to v51's analyst-LLM-at-proxy path (Limitation lim:semextract).
-// ═══════════════════════════════════════════════════════════════════════
 pub async fn delivery_log_register(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ProxyRegisterRequest>,
@@ -568,8 +515,6 @@ pub async fn delivery_log_register(
     let mut skipped_no_shard: Vec<String> = Vec::new();
 
     for shard_key in &req.shards_used {
-        // v50.1: skip-if-exists — preserve the agent's true read-time
-        // version established by the HTTP GET path. See header comment.
         if state.bus.has_delivery(&req.agent_id, shard_key) {
             skipped_existing.push(shard_key.clone());
             tracing::debug!(
@@ -579,15 +524,7 @@ pub async fn delivery_log_register(
             );
             continue;
         }
-
-        // No existing entry — record at current registry version. This
-        // extends DL coverage to references the agent has never HTTP-
-        // fetched, but carries the structural caveat that current-version
-        // ≠ the agent's actual knowledge of that shard. Agents that
-        // commit against such entries may pass ORI's check trivially;
-        // this is the remaining R_hidden gap that analyst-LLM semantic
-        // extraction (v51) will close by parsing per-reference versions
-        // out of the LLM context.
+        
         match state.bus.get_shard_version(shard_key) {
             Some(v) => {
                 state.bus.record_delivery(&req.agent_id, shard_key, v);

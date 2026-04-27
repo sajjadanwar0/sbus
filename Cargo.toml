@@ -10,10 +10,6 @@ authors      = ["Sajjad Khan <sajjadanwar0@gmail.com>"]
 license      = "MIT"
 repository   = "https://github.com/sajjadanwar0/sbus"
 
-# Shared dependency versions. Member crates pick from this pool via
-# `dependency.workspace = true` so all three binaries build against the
-# same major versions — matches paper §VI's "matched-language Rust"
-# discipline for §VII-N baseline comparison.
 [workspace.dependencies]
 tokio              = { version = "1",    features = ["full"] }
 axum               = { version = "0.8",  features = ["macros"] }

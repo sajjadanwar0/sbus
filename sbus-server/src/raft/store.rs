@@ -22,7 +22,6 @@ pub fn open_db(path: &str) -> (Tree, Tree) {
     (logs, meta)
 }
 
-/// Wrap any display-able error into an openraft `StorageError`.
 fn to_err<E: std::fmt::Display>(e: E) -> StorageError<u64> {
     StorageIOError::read_snapshot(None, &std::io::Error::other(e.to_string())).into()
 }
@@ -155,8 +154,6 @@ impl RaftLogReader<SBusTypeConfig> for SBusStore {
     }
 }
 
-// ── RaftSnapshotBuilder ──────────────────────────────────────────────────────
-
 #[async_trait]
 impl RaftSnapshotBuilder<SBusTypeConfig> for SBusStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<SBusTypeConfig>, StorageError<u64>> {
@@ -196,8 +193,6 @@ impl RaftSnapshotBuilder<SBusTypeConfig> for SBusStore {
     }
 }
 
-// ── RaftStorage ──────────────────────────────────────────────────────────────
-
 #[async_trait]
 impl RaftStorage<SBusTypeConfig> for SBusStore {
     type LogReader       = Self;
@@ -213,9 +208,6 @@ impl RaftStorage<SBusTypeConfig> for SBusStore {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        // The log reader only touches the `logs` / `meta` trees. A default
-        // (empty) engine is fine here because `try_get_log_entries` never
-        // calls through to the state machine.
         SBusStore {
             logs: self.logs.clone(),
             meta: self.meta.clone(),

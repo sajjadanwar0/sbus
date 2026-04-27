@@ -187,7 +187,7 @@ in `bus/types.rs`.
 
 ```bash
 cargo test --release           # unit tests
-cargo clippy --release -- -D warnings   # zero-warnings policy
+cargo clippy --release -- -D warnings
 ```
 
 End-to-end staleness rejection (paper §VII-C):

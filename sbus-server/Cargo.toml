@@ -1,6 +1,6 @@
 [package]
 name         = "sbus-server"
-description  = "S-Bus: ORI middleware with full Raft replication"
+description  = "S-Bus"
 version      .workspace = true
 edition      .workspace = true
 rust-version .workspace = true
@@ -29,4 +29,3 @@ reqwest            = { version = "0.12",   features = ["json"] }
 async-trait        = "0.1"
 openraft           = { version = "=0.8.4", features = ["serde"] }
 sled               = "0.34"
-uuid               = { version = "1.23.1", features = ["v4"] }

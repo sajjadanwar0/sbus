@@ -144,17 +144,6 @@ impl DeliveryLog {
         );
     }
 
-    /// NEW in v50.1 — returns true if `agent_id` already has a live (non-
-    /// expired) DeliveryLog entry for `key`. Used by the proxy-register
-    /// handler to implement skip-if-exists semantics: the proxy must not
-    /// overwrite an existing entry with a current version, because doing
-    /// so erases the agent's true read-time version and trivially passes
-    /// ORI's cross-shard check at commit time (safety violation; see
-    /// §VII-T Exp. PROXY-PH2).
-    ///
-    /// TTL-expired sessions are treated as not-having-entry, so a stale
-    /// session is re-populated with a fresh version rather than preserved
-    /// with an outdated one.
     pub fn has_entry(&self, agent_id: &str, key: &str) -> bool {
         if self.disabled {
             return false;
@@ -165,7 +154,6 @@ impl DeliveryLog {
             return false;
         }
         let Some(e) = s.entries.get(key) else { return false; };
-        // Entry exists but may have aged out of TTL.
         Instant::now().duration_since(e.delivered_at) < self.ttl
     }
 
@@ -186,11 +174,6 @@ impl DeliveryLog {
         }
     }
 
-    /// `reset_session` explicitly clears ALL entries for an agent. Use at the
-    /// start of a new session (e.g. `POST /session`) to prevent cross-run
-    /// accumulation when agent IDs are reused across independent runs.
-    ///
-    /// Do NOT call from the Raft-log application path — use `touch` there.
     pub fn reset_session(&self, agent_id: &str) {
         if self.disabled {
             return;
@@ -309,10 +292,6 @@ impl Default for DeliveryLog {
         Self::new()
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Tests
-// ═══════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {

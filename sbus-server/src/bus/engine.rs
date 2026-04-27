@@ -102,28 +102,8 @@ pub struct SBus {
     commits: Arc<AtomicU64>,
     conflicts: Arc<AtomicU64>,
     cross_stale: Arc<AtomicU64>,
-    /// View-divergence counter, INDEPENDENT of `ori_enabled`.
-    /// Increments every time a commit's effective read-set has a sibling
-    /// version that differs from the registry's current version, REGARDLESS
-    /// of whether the commit was rejected (ori_on) or allowed through
-    /// (ori_off). This is the workload-B outcome-quality signal: under
-    /// ori_off, view_divergent_commits counts commits that succeeded
-    /// despite being structurally stale — exactly the failure mode ORI
-    /// is supposed to prevent.
     view_divergent_commits: Arc<AtomicU64>,
-    /// Total commits where the cross-shard view was checked (denominator
-    /// for view-divergence rate).
     view_checked_commits: Arc<AtomicU64>,
-    /// Runtime-toggleable cross-shard staleness check. When `false`, the
-    /// commit path skips the DeliveryLog cross-shard validation and degrades
-    /// to per-shard OCC only (last-writer-wins on cross-shard reads).
-    /// Used by Workload-B (data-pipeline planning) to provide an ORI-OFF
-    /// baseline. Defaults to `true` (ORI enforced) on every SBus instance;
-    /// the harness flips it via `POST /admin/config` per trial.
-    ///
-    /// Per-shard version checking and ownership-token semantics are NOT
-    /// affected by this flag — only the cross-shard staleness check
-    /// (`commit_delta` lines that read `eff_rs`) is gated.
     ori_enabled: Arc<AtomicBool>,
     max_log_depth: usize,
     wal: Arc<Wal>,
@@ -152,17 +132,10 @@ impl SBus {
         }
     }
 
-    /// Toggle the cross-shard staleness check at runtime. Called from the
-    /// `POST /admin/config` admin handler. Default is `true` (ORI enforced).
-    /// When `false`, `commit_delta` skips the DeliveryLog cross-shard
-    /// validation, leaving only per-shard version-checking and ownership-
-    /// token semantics in place.
     pub fn set_ori_enabled(&self, enabled: bool) {
         self.ori_enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Read the current ORI-enabled flag value. Used by `admin_get_config`
-    /// for harness verification before each trial.
     pub fn is_ori_enabled(&self) -> bool {
         self.ori_enabled.load(Ordering::SeqCst)
     }
@@ -171,10 +144,6 @@ impl SBus {
         self.delivery_log.record(agent_id, shard_key, version);
     }
 
-    /// NEW in v50.1 — returns true if `agent_id` already has a live
-    /// DeliveryLog entry for `shard_key`. Used by the proxy-register
-    /// handler to implement skip-if-exists semantics. See
-    /// registry::DeliveryLog::has_entry for the safety rationale.
     pub fn has_delivery(&self, agent_id: &str, shard_key: &str) -> bool {
         self.delivery_log.has_entry(agent_id, shard_key)
     }
@@ -279,18 +248,7 @@ impl SBus {
                 agent_id: req.agent_id.clone(),
                 message: e.to_string(),
             })?;
-
-        // Cross-shard view-divergence detection. The detection itself runs
-        // under BOTH conditions (ori_on and ori_off) so the workload-B
-        // outcome-quality experiment can measure how often agents commit
-        // with stale cross-shard views. ORI's safety guarantee is enforced
-        // by REJECTING (HTTP-409) on divergence; ori_off allows the commit
-        // through but still counts the divergence in view_divergent_commits.
-        //
-        // Under ori_on: rejected commits → CrossShardStale; non-rejected
-        //   commits all had fresh views (zero divergence).
-        // Under ori_off: divergent commits succeed silently; the divergence
-        //   counter measures how many got through.
+        
         let mut had_divergence = false;
         for (k, v) in &eff_rs {
             if k == &req.key {
@@ -310,14 +268,11 @@ impl SBus {
                         current_version: cur,
                     });
                 }
-                // ori_off: don't reject, but keep iterating to confirm we
-                // know about this divergence. Don't double-count: one
-                // divergent commit, regardless of how many siblings stale.
+              
                 break;
             }
         }
-        // Count once per (committed-or-not) attempt that passed through
-        // the cross-shard check.
+    
         if !eff_rs.is_empty() {
             self.view_checked_commits.fetch_add(1, Ordering::Relaxed);
             if had_divergence {
@@ -504,11 +459,6 @@ impl SBus {
         n
     }
 
-    /// Workload-B server-side view-divergence counters. Returns
-    /// `(view_checked_commits, view_divergent_commits)` — how many commits
-    /// had their cross-shard view checked, and how many of those had at
-    /// least one stale sibling. Under ORI-ON, the divergent ones were
-    /// rejected; under ORI-OFF, they succeeded silently.
     pub fn view_divergence_counters(&self) -> (u64, u64) {
         (
             self.view_checked_commits.load(Ordering::Relaxed),

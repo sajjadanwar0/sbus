@@ -60,10 +60,6 @@ impl ClusterConfig {
         Self { enabled: true, node_id, nodes, this_url, client }
     }
 }
-
-// ── HTTP helpers ─────────────────────────────────────────────────────────────
-
-/// POST JSON body to `url`, return `(status_code, response_body)`.
 pub async fn post_json<B: Serialize>(
     client: &Client,
     url:    &str,
@@ -79,8 +75,6 @@ pub async fn post_json<B: Serialize>(
     let value: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
     Ok((status, value))
 }
-
-// ── Cluster status dashboard ─────────────────────────────────────────────────
 
 pub async fn cluster_status(cfg: &ClusterConfig) -> Value {
     let mut peers = Vec::with_capacity(cfg.nodes.len());
