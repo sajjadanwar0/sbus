@@ -278,7 +278,6 @@ and require this repository's binaries running. See that repo's
   author      = {Khan, Sajjad},
   title       = {S-Bus: Automatic Read-Set Reconstruction for Multi-Agent
                  LLM State Coordination},
-  institution = {Independent},
   year        = {2026},
   note        = {waiting for arXiv endorsment...}
 }
