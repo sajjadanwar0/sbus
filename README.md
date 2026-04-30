@@ -280,12 +280,9 @@ and require this repository's binaries running. See that repo's
                  LLM State Coordination},
   institution = {Independent},
   year        = {2026},
-  note        = {arXiv preprint}
+  note        = {waiting for arXiv endorsment...}
 }
 ```
-
-_Once the arXiv ID is assigned, add `url = {https://arxiv.org/abs/XXXX.XXXXX}`
-and the eprint ID to the BibTeX above._
 
 ---
 
