@@ -6,7 +6,7 @@ This repository contains the Rust workspace measured in:
 
 > *S-Bus: Automatic Read-Set Reconstruction for Multi-Agent LLM State
 > Coordination.* Sajjad Khan, 2026.
-> [📄 Paper PDF](./sbus.pdf) — _arXiv ID forthcoming._
+> [Paper PDF](./sbus.pdf) — _arXiv ID forthcoming._
 
 S-Bus is an HTTP middleware that applies optimistic concurrency control
 to multi-agent LLM state. The server-side **DeliveryLog** records
