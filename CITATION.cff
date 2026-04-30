@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: "S-Bus: Automatic Read-Set Reconstruction for Multi-Agent LLM State Coordination"
+authors:
+  - family-names: Khan
+    given-names: Sajjad
+    orcid: https://orcid.org/0009-0007-8627-7682
+date-released: 2026-04-29
+version: "1.0"
+repository-code: https://github.com/sajjadanwar0/sbus
+license: Apache-2.0
