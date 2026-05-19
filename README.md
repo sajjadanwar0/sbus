@@ -6,7 +6,7 @@ This repository contains the Rust workspace measured in:
 
 > *S-Bus: Automatic Read-Set Reconstruction for Multi-Agent LLM State
 > Coordination.* Sajjad Khan, 2026.
-> [Paper PDF](./sbus.pdf) — _arXiv ID forthcoming._
+> [arXiv:2605.17076](https://arxiv.org/abs/2605.17076) [cs.LG].
 
 S-Bus is an HTTP middleware that applies optimistic concurrency control
 to multi-agent LLM state. The server-side **DeliveryLog** records
@@ -41,8 +41,6 @@ sbus/
 ├── Cargo.lock
 ├── README.md                    this file
 ├── LICENSE                      MIT
-├── sbus.pdf                     paper PDF
-│
 ├── sbus-server/                 the measured system (~2,953 LOC)
 │   ├── src/
 │   │   ├── main.rs              Axum server entry
@@ -277,12 +275,14 @@ and require this repository's binaries running. See that repo's
 
 ```bibtex
 @misc{khan2026sbus,
-  author       = {Khan, Sajjad},
-  title        = {{S-Bus}: Automatic Read-Set Reconstruction for Multi-Agent
-                  {LLM} State Coordination},
-  year         = {2026},
-  note         = {Preprint},
-  howpublished = {\url{https://github.com/sajjadanwar0/sbus}}
+  author        = {Khan, Sajjad},
+  title         = {{S-Bus}: Automatic Read-Set Reconstruction for Multi-Agent
+                   {LLM} State Coordination},
+  year          = {2026},
+  eprint        = {2605.17076},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2605.17076}
 }
 ```
 
