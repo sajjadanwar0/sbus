@@ -282,7 +282,8 @@ and require this repository's binaries running. See that repo's
   eprint        = {2605.17076},
   archivePrefix = {arXiv},
   primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2605.17076}
+  url           = {https://arxiv.org/abs/2605.17076},
+  note          = {Under review at The VLDB Journal}
 }
 ```
 
