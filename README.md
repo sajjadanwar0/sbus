@@ -19,7 +19,9 @@ under HTTP/1.1.
 
 - [`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments) —
   Python experimental harness producing every empirical measurement in
-  the paper.
+  the paper, including the PH-3 LLM-judge validation against an
+  independent human annotator (strict κ=0.93, n=93, 96.8% raw agreement)
+  added in v2 of the preprint.
 - [`sbus-formals`](https://github.com/sajjadanwar0/sbus-formals) —
   TLA+, TLAPS, and Dafny mechanised proofs.
 
@@ -160,7 +162,7 @@ cargo bench -p sbus-server
 ```
 
 Criterion micro-benchmarks for the ACP commit path. The paper reports
-ACP overhead of approximately 5 µs per commit at N=4 (≈ 0.06% of a
+ACP overhead of approximately 5 μs per commit at N=4 (≈ 0.06% of a
 typical LLM inference call); your numbers will vary by hardware.
 
 ---
@@ -241,7 +243,10 @@ these counters.
 The end-to-end experiments live in
 [`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments)
 and require this repository's binaries running. See that repo's
-`README.md` for the full reproduction recipe.
+`README.md` for the full reproduction recipe, including the PH-3
+LLM-judge validation against the independent human annotator
+(`first.csv`, `second_human_annotator.csv`, `score_annotations.py`)
+added in v2 of the preprint.
 
 ---
 
@@ -260,8 +265,8 @@ and require this repository's binaries running. See that repo's
 
 - **Formal correspondence between this code and the paper's TLA+/Dafny
   specifications.** Refinement to the implementation is empirical
-  (884K-attempt zero-corruption evidence in the paper), not mechanised.
-  Standard practice short of IronFleet. See
+  (884,110-attempt zero-corruption evidence in the paper), not
+  mechanised. Standard practice short of IronFleet. See
   [`sbus-formals`](https://github.com/sajjadanwar0/sbus-formals) for
   the abstract-algorithm proofs.
 - **Production hardening.** This is a research artifact. There is no
@@ -282,7 +287,8 @@ and require this repository's binaries running. See that repo's
   eprint        = {2605.17076},
   archivePrefix = {arXiv},
   primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2605.17076}
+  url           = {https://arxiv.org/abs/2605.17076},
+  note          = {Preprint}
 }
 ```
 
