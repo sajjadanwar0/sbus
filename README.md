@@ -15,7 +15,7 @@ each agent's read-set at commit time and rejecting commits whose
 cross-shard reads have been superseded — without any agent SDK changes
 under HTTP/1.1.
 
-**Companion repositories:**
+**Companion repositories and datasets:**
 
 - [`sbus-experiments`](https://github.com/sajjadanwar0/sbus-experiments) —
   Python experimental harness producing every empirical measurement in
@@ -24,6 +24,17 @@ under HTTP/1.1.
   added in v2 of the preprint.
 - [`sbus-formals`](https://github.com/sajjadanwar0/sbus-formals) —
   TLA+, TLAPS, and Dafny mechanised proofs.
+- [`sbus-benchmarks` on Hugging Face](https://huggingface.co/datasets/sajjadanwar0/sbus-benchmarks) —
+  the PH-3 human annotations and the long-horizon planning benchmarks
+  used in the paper, archived for direct citation and reuse. Two configs:
+  - `ph3_human_annotations`: two independent human raters on 400
+    (session, shard) pairs; strict yes/no κ=0.93, 3-class κ=0.69, with
+    77% of rows carrying at least one "unclear" label reported as a
+    substantive finding rather than smoothed away.
+  - `long_horizon_tasks`: 15-task LHP set plus a 30-task multidomain set.
+
+  The annotation tool (HTML UI, protocol guide, and scoring script) is
+  bundled so the IRR study can be reproduced end-to-end.
 
 ---
 
@@ -248,6 +259,12 @@ LLM-judge validation against the independent human annotator
 (`first.csv`, `second_human_annotator.csv`, `score_annotations.py`)
 added in v2 of the preprint.
 
+The PH-3 human annotations and the long-horizon planning benchmarks
+referenced above are also archived on Hugging Face at
+[`sajjadanwar0/sbus-benchmarks`](https://huggingface.co/datasets/sajjadanwar0/sbus-benchmarks)
+for direct citation and reuse, with the annotation tool, protocol guide,
+and scoring script bundled.
+
 ---
 
 ## What this repo establishes (and does not)
@@ -289,6 +306,20 @@ added in v2 of the preprint.
   primaryClass  = {cs.LG},
   url           = {https://arxiv.org/abs/2605.17076},
   note          = {Preprint}
+}
+```
+
+If you use the bundled dataset, please also cite the Hugging Face
+repository:
+
+```bibtex
+@misc{khan2026sbusbenchmarks,
+  author       = {Khan, Sajjad},
+  title        = {{sbus-benchmarks}: PH-3 human annotations and long-horizon
+                  planning benchmarks for the {S-Bus} paper},
+  year         = {2026},
+  publisher    = {Hugging Face},
+  howpublished = {\url{https://huggingface.co/datasets/sajjadanwar0/sbus-benchmarks}}
 }
 ```
 
